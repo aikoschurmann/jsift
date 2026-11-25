@@ -44,6 +44,12 @@ pub const Sum = struct {
 
     fn add(self: *Sum, number: f64, int: ?i64) void {
         if (int) |int_value| self.int += int_value else self.all_int = false;
+        self.addFloat(number);
+        self.count += 1;
+    }
+
+    /// Adds `number` to `float`, and the bits the addition rounds off to `compensation`.
+    fn addFloat(self: *Sum, number: f64) void {
         const next = self.float + number;
         // An infinity would turn the compensation into nan. The sum is infinite anyway.
         if (std.math.isFinite(next)) {
@@ -54,7 +60,17 @@ pub const Sum = struct {
             }
         }
         self.float = next;
-        self.count += 1;
+    }
+
+    /// Adds the values summed in `later`, as if they had been added after this sum's. The
+    /// integer parts add exactly. The float parts are added with the same compensated step
+    /// as a single value, and the compensations add up, so neither side's lost bits are lost.
+    fn merge(self: *Sum, later: Sum) void {
+        self.int += later.int;
+        self.all_int = self.all_int and later.all_int;
+        self.addFloat(later.float);
+        self.compensation += later.compensation;
+        self.count += later.count;
     }
 
     fn total(self: Sum) Number {
@@ -86,6 +102,13 @@ pub const Extreme = struct {
         if (!self.seen or self.before(number, int, is_min)) {
             self.* = .{ .value = number, .int = int, .seen = true };
         }
+    }
+
+    /// Folds in `later`, the extreme of the values after this one's. Its value replaces this
+    /// one only when it comes strictly before, as each value would one by one, so a tie keeps
+    /// the value seen first.
+    fn merge(self: *Extreme, later: Extreme, comptime is_min: bool) void {
+        if (later.seen) self.add(later.value, later.int, is_min);
     }
 
     fn result(self: Extreme) Number {
@@ -133,6 +156,21 @@ pub const AggState = union(enum) {
     max: Extreme,
     avg: Sum,
 };
+
+/// Folds `later`, the state of the input that follows `state`'s, into `state`. Splitting the
+/// input in two, aggregating each part and merging gives the result of aggregating it whole:
+/// counts and integer sums exactly, float sums to within the compensated sum's error.
+/// A plain field keeps the value it already has: a group's value as first seen.
+pub fn merge(state: *AggState, later: AggState) void {
+    switch (state.*) {
+        .raw => {},
+        .count => |*count| count.* += later.count,
+        .sum => |*sum| sum.merge(later.sum),
+        .avg => |*sum| sum.merge(later.avg),
+        .min => |*extreme| extreme.merge(later.min, true),
+        .max => |*extreme| extreme.merge(later.max, false),
+    }
+}
 
 /// Writes one byte inside a CSV quoted field. A quote is doubled, which is CSV's escape.
 fn writeCsvByte(writer: *std.Io.Writer, byte: u8) !void {

@@ -919,6 +919,8 @@ fn runParallel(
     };
     // The last one is the calling thread's, for the chunks it scans while it helps.
     const workers = try allocator.alloc(Worker, threads);
+    // The states before any input, copied before `search.agg_states` starts collecting totals.
+    const template = try allocator.dupe(output.AggState, search.agg_states);
     var workers_ready: usize = 0;
     defer {
         for (results) |*result| {
@@ -933,7 +935,7 @@ fn runParallel(
     for (workers) |*worker| {
         worker.* = .{
             .feed = feed,
-            .template = search.agg_states,
+            .template = template,
             .search = undefined,
             .arena = .init(page_allocator),
         };
@@ -991,7 +993,14 @@ fn writeInOrder(search: *Search, helper: *Worker, failed_file: ?FailedFile) !voi
                 continue :step feed.nextStep(seq);
             },
             .scan_head => {
-                // Straight into the output and the totals.
+                if (search.plan.has_aggregations) {
+                    // Through a chunk result, as a worker would. The totals are then merged from
+                    // the same per-chunk parts whichever thread scanned a chunk, so a float sum
+                    // doesn't depend on timing.
+                    helper.scan(seq);
+                    continue :step .write_head;
+                }
+                // Straight into the output.
                 search.lines_seen = chunk.first_line;
                 const limit_reached = try search.scanBlock(chunk.input);
                 try search.writer.flush();
@@ -1011,6 +1020,7 @@ fn writeInOrder(search: *Search, helper: *Worker, failed_file: ?FailedFile) !voi
                 }
                 try search.writer.writeAll(result.out.written());
                 search.match_count += result.match_count;
+                try mergeResult(search, result);
                 // Flush per chunk so streaming input (`tail -f`) produces output as it arrives.
                 try search.writer.flush();
                 if (search.match_count == limit) return;
@@ -1025,6 +1035,36 @@ fn writeInOrder(search: *Search, helper: *Worker, failed_file: ?FailedFile) !voi
         if (chunk.last) return;
         // Hand the slot back to the feeder.
         feed.free.post(feed.io);
+    }
+}
+
+/// Folds a chunk's aggregates and groups into the totals in `search`. Chunks are merged in
+/// input order, so groups keep their first-seen order and the spelling they were first seen
+/// with, and min and max keep the first of equal values.
+fn mergeResult(search: *Search, result: *const ChunkResult) !void {
+    const plan = search.plan;
+    if (!plan.has_aggregations) return;
+    if (plan.group_keys.len == 0) {
+        for (search.agg_states, result.agg_states) |*total, part| output.merge(total, part);
+        return;
+    }
+    const allocator = search.group_alloc;
+    for (result.group_map.keys(), result.group_map.values()) |key, states| {
+        const entry = try search.group_map.getOrPut(allocator, key);
+        if (entry.found_existing) {
+            for (entry.value_ptr.*, states) |*total, part| output.merge(total, part);
+            continue;
+        }
+        // The chunk's arena is reset when its slot is reused, so a new group is copied out.
+        entry.key_ptr.* = try allocator.dupe(u8, key);
+        const copy = try allocator.dupe(output.AggState, states);
+        for (copy) |*state| switch (state.*) {
+            .raw => |*raw| if (raw.*) |value| {
+                raw.* = .{ .raw = try allocator.dupe(u8, value.raw), .is_string = value.is_string };
+            },
+            else => {},
+        };
+        entry.value_ptr.* = copy;
     }
 }
 
@@ -1097,7 +1137,7 @@ const min_parallel_chunks = 4;
 fn chooseScan(input: Input, config: cli.Config, plan: *const compile.CompiledPlan, io: std.Io) ScanMode {
     const single: ScanMode = .{ .threads = 1, .may_block = false };
     const threads = config.threads orelse defaultThreads();
-    if (threads <= 1 or plan.has_aggregations or plan.line_numbers) return single;
+    if (threads <= 1 or plan.line_numbers) return single;
     const probe = probeInput(input, io);
     const chunk_size: usize = @min(config.block_size, parallel_block_size);
     if (probe.size) |bytes| if (bytes <= min_parallel_chunks * chunk_size) return single;
@@ -1389,6 +1429,64 @@ test "aggregates print exact, shortest numbers" {
     try expectQuery("{\"b\":2.0}\n{\"b\":-0.0}\n", &.{ "SELECT", "sum:b,min:b" }, "2\t0\n");
     try expectQuery("{\"b\":1e300}\n{\"b\":1e-9}\n", &.{ "SELECT", "max:b,min:b" }, "1e300\t1e-9\n");
     try expectQuery("{\"b\":1e400}\n{\"b\":1}\n", &.{ "SELECT", "sum:b" }, "inf\n");
+}
+
+test "aggregates merge exactly across chunks" {
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+
+    // Integers above 2^53, and a total beyond i64: exact in every chunk and in the merge.
+    var ints: std.ArrayList(u8) = .empty;
+    var total: i128 = 0;
+    for (0..600) |index| {
+        const value: i64 = if (index % 5 == 0) -(1 << 62) + @as(i64, @intCast(index)) else (1 << 62) + @as(i64, @intCast(index));
+        try ints.print(a, "{{\"n\":{d}}}\n", .{value});
+        total += value;
+    }
+    const expected_ints = try std.fmt.allocPrint(a, "{d}\t{d}\t{d}\t600\n", .{ total, -(1 << 62), (1 << 62) + 599 });
+    try expectQuery(ints.items, &.{ "SELECT", "sum:n,min:n,max:n,count:n" }, expected_ints);
+
+    // Float sums keep the compensation of every chunk. Summed naively, 10000 times 0.1 is
+    // 1000.0000000001588, and the ones would vanish next to 1e16.
+    var floats: std.ArrayList(u8) = .empty;
+    for (0..10000) |_| try floats.appendSlice(a, "{\"b\":0.1}\n");
+    try expectQuery(floats.items, &.{ "SELECT", "sum:b,avg:b" }, "1000\t0.1\n");
+    var mixed: std.ArrayList(u8) = .empty;
+    try mixed.appendSlice(a, "{\"b\":1e16}\n");
+    for (0..1000) |_| try mixed.appendSlice(a, "{\"b\":1.0}\n");
+    try mixed.appendSlice(a, "{\"b\":-1e16}\n");
+    try expectQuery(mixed.items, &.{ "SELECT", "sum:b,min:b,max:b" }, "1000\t-10000000000000000\t10000000000000000\n");
+    // An integer and a float that compare equal: min keeps the one seen first.
+    var ties: std.ArrayList(u8) = .empty;
+    for (0..300) |index| try ties.appendSlice(a, if (index == 0) "{\"b\":3}\n" else "{\"b\":3.0}\n");
+    try expectQuery(ties.items, &.{ "SELECT", "min:b,sum:b" }, "3\t900\n");
+}
+
+test "GROUP BY keeps first-seen order and spelling across chunks" {
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    const names = [_][]const u8{ "a", "b", "c", "d", "e", "f", "g", "h", "i" };
+    var input: std.ArrayList(u8) = .empty;
+    var order: std.ArrayList(usize) = .empty;
+    var counts = [_]usize{0} ** names.len;
+    var sums = [_]usize{0} ** names.len;
+    for (0..1500) |index| {
+        // Three groups at first, the others only in later chunks.
+        const group = if (index < 700) index % 3 else (index * 7) % names.len;
+        if (counts[group] == 0) try order.append(a, group);
+        // A group's first line spells its name as an escape, which it then prints with.
+        if (counts[group] == 0)
+            try input.print(a, "{{\"svc\":\"\\u00{x}\",\"n\":{d}}}\n", .{ names[group][0], index })
+        else
+            try input.print(a, "{{\"svc\":\"{s}\",\"n\":{d}}}\n", .{ names[group], index });
+        counts[group] += 1;
+        sums[group] += index;
+    }
+    var expected: std.ArrayList(u8) = .empty;
+    for (order.items) |group| try expected.print(a, "\\u00{x}\t{d}\t{d}\n", .{ names[group][0], counts[group], sums[group] });
+    try expectQuery(input.items, &.{ "SELECT", "svc,count:n,sum:n", "GROUP", "BY", "svc" }, expected.items);
 }
 
 test "GROUP BY" {

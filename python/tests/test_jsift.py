@@ -117,3 +117,8 @@ def test_threads(jsonl_file):
 def test_large_input():
     big = DATA * 50_000
     assert jsift.count("level eq error", data=big) == 100_000
+
+
+def test_parentheses():
+    rows = jsift.search("(name eq a OR name eq b) AND age exists", data='{"name":"a","age":1}\n{"name":"b"}\n{"name":"c","age":2}\n')
+    assert rows == [{"name": "a", "age": 1}]

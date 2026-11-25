@@ -651,6 +651,12 @@ test "aggregates print exact, shortest numbers" {
     try expectQuery("{\"b\":1e400}\n{\"b\":1}\n", &.{ "SELECT", "sum:b" }, "inf\n");
 }
 
+test "parentheses group conditions" {
+    try expectQuery(demo, &.{ "SELECT", "name", "WHERE", "(tier", "eq", "1", "OR", "tier", "eq", "5)", "AND", "active", "eq", "b:true" }, "Alice\n");
+    try expectQuery(demo, &.{ "SELECT", "name", "WHERE", "NOT", "(", "age", "eq", "30", "OR", "tier", "eq", "5", ")" }, "Alice\nDave\n");
+    try expectQuery(demo, &.{ "SELECT", "name", "WHERE", "(age", "eq", "30", "OR", "age", "eq", "45)", "AND", "(tier", "lt", "3", "OR", "tier", "gt", "4)" }, "Bob\nEve\n");
+}
+
 test "in values can contain escaped commas" {
     const input = "{\"a\":\"x,y\"}\n{\"a\":\"x\"}\n{\"a\":\"z\"}\n";
     try expectQuery(input, &.{ "a", "in", "x\\,y,z" }, "{\"a\":\"x,y\"}\n{\"a\":\"z\"}\n");

@@ -103,6 +103,8 @@ fn errorMessage(err: anyerror, file_path: ?[*:0]const u8) []const u8 {
         error.MissingFormatValue => "--format needs json, csv or tsv",
         error.InvalidFormat => "--format must be json, csv or tsv",
         error.InvalidCondition => "incomplete condition, expected <key> <op> <val>",
+        error.UnbalancedParentheses => "unbalanced parentheses",
+        error.QueryTooComplex => "query too complex: its parentheses expand to more than 1024 OR groups",
         error.UnknownOperator => "unknown operator (eq, neq, gt, lt, gte, lte, has, exists, in)",
         error.InvertOption => "-v isn't an option: negate a condition with NOT",
         error.UnknownOption => "unknown option (put -- before query terms that start with --)",

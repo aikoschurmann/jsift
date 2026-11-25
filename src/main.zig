@@ -24,6 +24,8 @@ pub fn main(init: std.process.Init) u8 {
             error.InvalidLimit => "jsift: --limit must be a non-negative integer",
             error.MissingFormatValue => "jsift: --format needs json, csv or tsv",
             error.InvalidCondition => "jsift: incomplete condition, expected <key> <op> <val>",
+            error.UnbalancedParentheses => "jsift: unbalanced parentheses",
+            error.QueryTooComplex => "jsift: query too complex: its parentheses expand to more than 1024 OR groups",
             error.UnknownOperator => "jsift: unknown operator (eq, neq, gt, lt, gte, lte, has, exists, in)",
             error.InvertOption => "jsift: -v isn't an option: negate a condition with NOT (and use -V for the version)",
             error.UnknownOption => "jsift: unknown option (put -- before query terms that start with --)",

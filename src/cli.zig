@@ -64,6 +64,7 @@ pub fn printUsage() void {
         \\  exists:    Check key presence only, no value needed       (e.g. error exists)
         \\  Paths:     Keys are top-level; use dots for nested keys   (e.g. user.id eq 5, a\.b for a literal dot)
         \\  AND / OR:  Chain conditions                               (e.g. level eq error AND code gt 500)
+        \\  ( ):       Group; AND binds tighter than OR otherwise     (e.g. '(' level eq error OR level eq warn ')' AND code gt 500)
         \\  Aggregations: count:field, sum:field, min:field, max:field, avg:field
         \\
         \\Exit Codes:
@@ -91,12 +92,6 @@ fn parseOp(op_str: []const u8) ?Operator {
     if (std.ascii.eqlIgnoreCase(op_str, "exists")) return .exists;
     if (std.ascii.eqlIgnoreCase(op_str, "in")) return .in_op;
     return null;
-}
-
-/// Whether `tokens[index]` exists and is an operator. A keyword (`SELECT`, `NOT`) directly
-/// followed by an operator is a key instead, so `select eq 1` and `not exists` are conditions.
-fn isOperatorAt(tokens: []const []const u8, index: usize) bool {
-    return index < tokens.len and parseOp(tokens[index]) != null;
 }
 
 const SelectClause = struct {
@@ -148,67 +143,192 @@ fn parseSelectField(field: []const u8) struct { PluckType, []const u8 } {
     return .{ .raw, field };
 }
 
-/// Parses `[NOT] <key> <op> [<val>]` conditions joined by AND / OR. AND binds tighter, so
-/// the result is a list of OR'ed groups whose conditions are AND'ed.
-fn parseWhereClause(allocator: std.mem.Allocator, tokens: []const []const u8, start: usize) ![]ConditionGroup {
-    var groups: std.ArrayList(ConditionGroup) = .empty;
-    var current_conditions: std.ArrayList(Condition) = .empty;
-    // NOT toggles instead of setting, so `NOT NOT key` cancels out. The flag applies only to
-    // the next condition.
-    var negated = false;
-    var token_index = start;
+/// The most OR groups a WHERE clause may expand to. Parentheses are multiplied out into
+/// OR'ed groups of AND'ed conditions, which can grow exponentially:
+/// `(a OR b) AND (c OR d) AND ...` doubles with every factor.
+pub const max_groups = 1024;
 
-    while (token_index < tokens.len) {
-        if (std.ascii.eqlIgnoreCase(tokens[token_index], "not") and !isOperatorAt(tokens, token_index + 1)) {
-            negated = !negated;
-            token_index += 1;
-            continue;
-        }
+/// A WHERE clause as parsed, before it is flattened into groups.
+const Expr = union(enum) {
+    condition: Condition,
+    all: []const Expr,
+    any: []const Expr,
+    not: *const Expr,
+};
 
-        // A key must be followed by an operator.
-        if (token_index + 1 >= tokens.len) return error.InvalidCondition;
-        const key = tokens[token_index];
-        const op = parseOp(tokens[token_index + 1]) orelse return error.UnknownOperator;
+/// The query tokens, read one at a time. Parentheses may stand alone (`(`, `)`) or be
+/// attached to a token: leading ones to a key (`(level`), trailing ones to a value or to
+/// `exists` (`500)`). Trailing ones are only split off while a parenthesis is open, so a
+/// value such as `(none)` outside parentheses stays as it is.
+const TokenStream = struct {
+    tokens: []const []const u8,
+    index: usize = 0,
+    /// Leading `(` already consumed from `tokens[index]`.
+    front: usize = 0,
+    /// `)` split off the end of the previous token and not consumed yet.
+    closes: usize = 0,
+    /// Parentheses currently open.
+    depth: usize = 0,
 
-        var val: []const u8 = "";
-        if (op != .exists) {
-            // Every operator except `exists` takes a value.
-            if (token_index + 2 >= tokens.len) return error.InvalidCondition;
-            val = tokens[token_index + 2];
-            token_index += 3;
+    fn peek(self: *const TokenStream) ?[]const u8 {
+        if (self.closes > 0) return ")";
+        if (self.index >= self.tokens.len) return null;
+        return self.tokens[self.index][self.front..];
+    }
+
+    /// The token after the current one, for the keyword check in `isKeyword`.
+    fn peekSecond(self: *const TokenStream) ?[]const u8 {
+        if (self.closes > 0 or self.index + 1 >= self.tokens.len) return null;
+        return self.tokens[self.index + 1];
+    }
+
+    fn advance(self: *TokenStream) void {
+        if (self.closes > 0) {
+            self.closes -= 1;
         } else {
-            token_index += 2;
+            self.index += 1;
+            self.front = 0;
         }
+    }
 
-        try current_conditions.append(allocator, .{ .key = key, .val = val, .op = op, .negated = negated });
-        negated = false;
+    /// Takes the current token, splitting off as many trailing `)` as there are open
+    /// parentheses. They are returned as separate tokens afterwards.
+    fn takeClosing(self: *TokenStream) []const u8 {
+        const token = self.peek().?;
+        var end = token.len;
+        while (end > 0 and token[end - 1] == ')' and token.len - end < self.depth) end -= 1;
+        self.advance();
+        self.closes = token.len - end;
+        return token[0..end];
+    }
+};
 
-        // A condition is followed by AND, by OR, or by the end of the tokens.
-        if (token_index < tokens.len) {
-            const logical = tokens[token_index];
-            token_index += 1;
-            if (std.ascii.eqlIgnoreCase(logical, "or")) {
-                // OR closes the current AND group. The group becomes one alternative.
-                try groups.append(allocator, .{ .conditions = try current_conditions.toOwnedSlice(allocator) });
-                current_conditions = .empty;
-            } else if (!std.ascii.eqlIgnoreCase(logical, "and")) {
-                return error.InvalidCondition;
+/// Whether `token`, followed by `next`, is the keyword `word`. `NOT` and `SELECT` directly
+/// followed by an operator are keys instead, so `select eq 1` and `not exists` are conditions.
+fn isKeyword(token: []const u8, next: ?[]const u8, comptime word: []const u8) bool {
+    if (!std.ascii.eqlIgnoreCase(token, word)) return false;
+    const following = next orelse return true;
+    return parseOp(std.mem.trimEnd(u8, following, ")")) == null;
+}
+
+fn parseOr(allocator: std.mem.Allocator, stream: *TokenStream) error{ OutOfMemory, InvalidCondition, UnknownOperator, UnbalancedParentheses }!Expr {
+    var items: std.ArrayList(Expr) = .empty;
+    try items.append(allocator, try parseAnd(allocator, stream));
+    while (stream.peek()) |token| {
+        if (!std.ascii.eqlIgnoreCase(token, "or")) break;
+        stream.advance();
+        try items.append(allocator, try parseAnd(allocator, stream));
+    }
+    return if (items.items.len == 1) items.items[0] else .{ .any = try items.toOwnedSlice(allocator) };
+}
+
+fn parseAnd(allocator: std.mem.Allocator, stream: *TokenStream) !Expr {
+    var items: std.ArrayList(Expr) = .empty;
+    try items.append(allocator, try parseUnary(allocator, stream));
+    while (stream.peek()) |token| {
+        if (!std.ascii.eqlIgnoreCase(token, "and")) break;
+        stream.advance();
+        try items.append(allocator, try parseUnary(allocator, stream));
+    }
+    return if (items.items.len == 1) items.items[0] else .{ .all = try items.toOwnedSlice(allocator) };
+}
+
+/// `NOT <unary>`, `( <or> )` or a condition `<key> <op> [<val>]`.
+fn parseUnary(allocator: std.mem.Allocator, stream: *TokenStream) !Expr {
+    // Running out of tokens here means a trailing AND, OR, NOT or `(`.
+    const token = stream.peek() orelse return error.InvalidCondition;
+
+    if (stream.front == 0 and isKeyword(token, stream.peekSecond(), "not")) {
+        stream.advance();
+        const inner = try allocator.create(Expr);
+        inner.* = try parseUnary(allocator, stream);
+        return .{ .not = inner };
+    }
+
+    if (token.len > 0 and token[0] == '(') {
+        if (token.len == 1) stream.advance() else stream.front += 1;
+        stream.depth += 1;
+        const inner = try parseOr(allocator, stream);
+        const close = stream.peek() orelse return error.UnbalancedParentheses;
+        if (!std.mem.eql(u8, close, ")")) return error.InvalidCondition;
+        stream.advance();
+        stream.depth -= 1;
+        return inner;
+    }
+    // A `)` where a condition should start: an empty `()` inside parentheses, else a stray one.
+    if (std.mem.eql(u8, token, ")")) return if (stream.depth > 0) error.InvalidCondition else error.UnbalancedParentheses;
+
+    const key = token;
+    stream.advance();
+    const op_token = stream.peek() orelse return error.InvalidCondition;
+    // `exists` takes no value, so closing parentheses may be attached to it.
+    const op_trimmed = std.mem.trimEnd(u8, op_token, ")");
+    if (op_trimmed.len < op_token.len and parseOp(op_trimmed) == .exists) {
+        _ = stream.takeClosing();
+        return .{ .condition = .{ .key = key, .val = "", .op = .exists } };
+    }
+    const op = parseOp(op_token) orelse return error.UnknownOperator;
+    stream.advance();
+    if (op == .exists) return .{ .condition = .{ .key = key, .val = "", .op = op } };
+
+    // Every operator except `exists` takes a value.
+    if (stream.peek() == null) return error.InvalidCondition;
+    return .{ .condition = .{ .key = key, .val = stream.takeClosing(), .op = op } };
+}
+
+/// Flattens `expr` into OR'ed groups of AND'ed conditions. NOT is pushed down to the
+/// conditions with De Morgan's laws, and AND is multiplied out over OR.
+fn toGroups(allocator: std.mem.Allocator, expr: Expr, negated: bool) error{ OutOfMemory, QueryTooComplex }![]const []const Condition {
+    switch (expr) {
+        .condition => |condition| {
+            var flipped = condition;
+            flipped.negated = condition.negated != negated;
+            const conditions = try allocator.dupe(Condition, &.{flipped});
+            return allocator.dupe([]const Condition, &.{conditions});
+        },
+        .not => |inner| return toGroups(allocator, inner.*, !negated),
+        .all, .any => |items| {
+            // NOT (a AND b) is (NOT a) OR (NOT b), and NOT (a OR b) is (NOT a) AND (NOT b).
+            const is_or = (expr == .any) != negated;
+            var result: std.ArrayList([]const Condition) = .empty;
+            if (is_or) {
+                for (items) |item| try result.appendSlice(allocator, try toGroups(allocator, item, negated));
+                if (result.items.len > max_groups) return error.QueryTooComplex;
+                return result.toOwnedSlice(allocator);
             }
+            // AND: every combination of one group from each item.
+            try result.append(allocator, &.{});
+            for (items) |item| {
+                const item_groups = try toGroups(allocator, item, negated);
+                if (result.items.len * item_groups.len > max_groups) return error.QueryTooComplex;
+                var product: std.ArrayList([]const Condition) = .empty;
+                for (result.items) |left| {
+                    for (item_groups) |right| {
+                        try product.append(allocator, try std.mem.concat(allocator, Condition, &.{ left, right }));
+                    }
+                }
+                result = product;
+            }
+            return result.toOwnedSlice(allocator);
+        },
+    }
+}
 
-            // A trailing AND/OR with nothing after it is an incomplete condition.
-            if (token_index == tokens.len) return error.InvalidCondition;
-        }
+/// Parses the WHERE clause: conditions `[NOT] <key> <op> [<val>]` joined by AND and OR,
+/// with parentheses. AND binds tighter than OR. The result is a list of OR'ed groups whose
+/// conditions are AND'ed, which is the form the search evaluates.
+fn parseWhereClause(allocator: std.mem.Allocator, tokens: []const []const u8, start: usize) ![]ConditionGroup {
+    if (start == tokens.len) return &.{};
+    var stream: TokenStream = .{ .tokens = tokens[start..] };
+    const expr = try parseOr(allocator, &stream);
+    if (stream.peek()) |token| {
+        return if (std.mem.eql(u8, token, ")")) error.UnbalancedParentheses else error.InvalidCondition;
     }
 
-    // A NOT with no condition after it.
-    if (negated) return error.InvalidCondition;
-
-    // The last AND group is closed by the end of the tokens. It is empty only when there were
-    // no conditions at all.
-    if (current_conditions.items.len > 0) {
-        try groups.append(allocator, .{ .conditions = try current_conditions.toOwnedSlice(allocator) });
-    }
-    return groups.toOwnedSlice(allocator);
+    const flat = try toGroups(allocator, expr, false);
+    const groups = try allocator.alloc(ConditionGroup, flat.len);
+    for (flat, groups) |conditions, *group| group.* = .{ .conditions = try allocator.dupe(Condition, conditions) };
+    return groups;
 }
 
 /// Parses the arguments after the program name. `allocator` should be an arena: nothing
@@ -264,9 +384,11 @@ pub fn parseArgs(allocator: std.mem.Allocator, args: []const []const u8) !Comman
 
     // SELECT, if present, comes first among the query tokens.
     var next_token: usize = 0;
-    if (next_token < tokens.items.len and std.ascii.eqlIgnoreCase(tokens.items[next_token], "select") and
-        !isOperatorAt(tokens.items, next_token + 1))
-    {
+    if (next_token < tokens.items.len and isKeyword(
+        tokens.items[next_token],
+        if (next_token + 1 < tokens.items.len) tokens.items[next_token + 1] else null,
+        "select",
+    )) {
         next_token += 1;
         const select = try parseSelectClause(allocator, tokens.items, next_token);
         config.pluck = select.fields;
@@ -321,4 +443,58 @@ test "parseArgs flags and errors" {
 
     const limit0 = (try parseArgs(allocator, &.{ "--limit", "0", "a", "exists" })).run;
     try std.testing.expectEqual(@as(?usize, 0), limit0.limit);
+}
+
+/// Renders the groups as `a&!b|c`, one letter per key, for compact assertions.
+fn renderGroups(allocator: std.mem.Allocator, args: []const []const u8) ![]const u8 {
+    const config = (try parseArgs(allocator, args)).run;
+    var out: std.ArrayList(u8) = .empty;
+    for (config.groups, 0..) |group, group_index| {
+        if (group_index > 0) try out.append(allocator, '|');
+        for (group.conditions, 0..) |condition, index| {
+            if (index > 0) try out.append(allocator, '&');
+            if (condition.negated) try out.append(allocator, '!');
+            try out.appendSlice(allocator, condition.key);
+            if (condition.val.len > 0) {
+                try out.append(allocator, '=');
+                try out.appendSlice(allocator, condition.val);
+            }
+        }
+    }
+    return out.items;
+}
+
+test "parentheses" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    const expect = std.testing.expectEqualStrings;
+
+    // Without parentheses AND binds tighter.
+    try expect("a&b|c", try renderGroups(a, &.{ "a", "exists", "AND", "b", "exists", "OR", "c", "exists" }));
+    // Standalone and attached parentheses.
+    try expect("a&c|b&c", try renderGroups(a, &.{ "(", "a", "exists", "OR", "b", "exists", ")", "AND", "c", "exists" }));
+    try expect("a=1&c=3|b=2&c=3", try renderGroups(a, &.{ "(a", "eq", "1", "OR", "b", "eq", "2)", "AND", "c", "eq", "3" }));
+    try expect("a&b", try renderGroups(a, &.{ "((a", "exists)", "AND", "(b", "exists))" }));
+    // NOT is pushed down with De Morgan's laws.
+    try expect("!a&!b", try renderGroups(a, &.{ "NOT", "(a", "exists", "OR", "b", "exists)" }));
+    try expect("!a|!b", try renderGroups(a, &.{ "NOT", "(", "a", "exists", "AND", "b", "exists", ")" }));
+    try expect("a|b", try renderGroups(a, &.{ "NOT", "NOT", "(a", "exists", "OR", "b", "exists)" }));
+    // A trailing `)` is only split off while a parenthesis is open.
+    try expect("a=(none)", try renderGroups(a, &.{ "a", "eq", "(none)" }));
+    try expect("a=(none)", try renderGroups(a, &.{ "(a", "eq", "(none))" }));
+    try expect("a=x)", try renderGroups(a, &.{ "(a", "eq", "x))" }));
+
+    try std.testing.expectError(error.UnbalancedParentheses, parseArgs(a, &.{ "(a", "exists" }));
+    try std.testing.expectError(error.UnbalancedParentheses, parseArgs(a, &.{ "a", "exists", ")" }));
+    try std.testing.expectError(error.InvalidCondition, parseArgs(a, &.{ "(", ")" }));
+    try std.testing.expectError(error.InvalidCondition, parseArgs(a, &.{ "a", "exists", "b", "exists" }));
+
+    // 11 factors of two alternatives expand to 2048 groups, over the limit.
+    var many: std.ArrayList([]const u8) = .empty;
+    for (0..11) |index| {
+        if (index > 0) try many.append(a, "AND");
+        try many.appendSlice(a, &.{ "(a", "exists", "OR", "b", "exists)" });
+    }
+    try std.testing.expectError(error.QueryTooComplex, parseArgs(a, many.items));
 }

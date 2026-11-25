@@ -207,14 +207,18 @@ Keys may share a name with a keyword: `SELECT` and `NOT` count as keywords only 
 
 When a key appears twice in the same object, the last one counts, as in `jq`. Lines that aren't valid JSON never match, not even `NOT` conditions.
 
-Prefix a condition with `NOT` to negate it. `AND` binds tighter than `OR`, and there are no parentheses:
+Prefix a condition with `NOT` to negate it. `AND` binds tighter than `OR`, and parentheses group:
 
 ```bash
 # A AND B OR C AND D  ==  (A AND B) OR (C AND D)
 jsift --file demo.jsonl age eq 30 AND balance lt 0 OR tier eq 1 AND active eq true
+
+# Parentheses can stand alone or touch a key or value. Quote a standalone one for the shell.
+jsift --file demo.jsonl '(tier' eq 1 OR tier eq '5)' AND active eq b:true
+jsift --file demo.jsonl NOT '(' age eq 30 OR tier eq 5 ')'
 ```
 
-To get `(A OR B) AND C`, chain two runs: `jsift A OR B | jsift C`.
+A `)` at the end of a value is only split off while a parenthesis is open, so `name eq (none)` still compares with `(none)`. `NOT` also applies to a parenthesised group. jsift multiplies the parentheses out into OR'ed groups of AND'ed conditions, and refuses a query that would expand to more than 1024 groups.
 
 **`neq` vs `NOT … eq`:** every operator, `neq` included, requires the key to be present. `NOT` simply inverts the result, so `NOT a eq 1` also matches lines that have no `a` at all:
 

@@ -10,6 +10,9 @@ const values = @import("values.zig");
 const match = @import("match.zig");
 const output = @import("output.zig");
 
+/// GROUP BY groups: the aggregation states of each group, by encoded key, in first-seen order.
+const GroupMap = std.StringArrayHashMapUnmanaged([]output.AggState);
+
 const Search = struct {
     plan: *const compile.CompiledPlan,
     agg_states: []output.AggState,
@@ -25,7 +28,7 @@ const Search = struct {
     match_count: usize = 0,
     /// GROUP BY: the aggregation states of each group, by encoded key, in first-seen order.
     /// `agg_states` is then only the template that new groups are copied from.
-    group_map: std.StringArrayHashMapUnmanaged([]output.AggState) = .empty,
+    group_map: GroupMap = .empty,
     /// The encoded key of the current line's group, reused between lines.
     group_key: std.ArrayList(u8) = .empty,
 
@@ -72,7 +75,9 @@ const Search = struct {
             try self.group_key.appendSlice(self.scratch.gpa, text);
         }
 
-        const entry = try self.group_map.getOrPut(gpa, self.group_key.items);
+        // `getOrPut`, inlined by hand: `mergeResult` looks groups up too, and with a second
+        // caller the compiler stopped inlining the lookup here, which made GROUP BY 5% slower.
+        const entry = try @call(.always_inline, GroupMap.getOrPutContext, .{ &self.group_map, gpa, self.group_key.items, std.array_hash_map.StringContext{} });
         if (!entry.found_existing) {
             // The key and values point into the input buffer, which is reused, so they are copied.
             entry.key_ptr.* = try gpa.dupe(u8, self.group_key.items);
@@ -812,7 +817,7 @@ const ChunkResult = struct {
     /// The chunk's own aggregates, merged into the totals in input order.
     agg_states: []output.AggState,
     /// GROUP BY: the chunk's own groups, in first-seen order, allocated in `arena`.
-    group_map: std.StringArrayHashMapUnmanaged([]output.AggState) = .empty,
+    group_map: GroupMap = .empty,
     arena: std.heap.ArenaAllocator,
     /// Why scanning the chunk failed. Reported when the chunk's turn comes.
     scan_err: ?anyerror = null,

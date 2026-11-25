@@ -1134,10 +1134,10 @@ const min_parallel_chunks = 4;
 
 /// Picks the scan for `input`. Inputs whose size is unknown (pipes) always get the parallel
 /// scan: it only starts workers once chunks pile up (see `Queue.spawned`).
-fn chooseScan(input: Input, config: cli.Config, plan: *const compile.CompiledPlan, io: std.Io) ScanMode {
+fn chooseScan(input: Input, config: cli.Config, io: std.Io) ScanMode {
     const single: ScanMode = .{ .threads = 1, .may_block = false };
     const threads = config.threads orelse defaultThreads();
-    if (threads <= 1 or plan.line_numbers) return single;
+    if (threads <= 1) return single;
     const probe = probeInput(input, io);
     const chunk_size: usize = @min(config.block_size, parallel_block_size);
     if (probe.size) |bytes| if (bytes <= min_parallel_chunks * chunk_size) return single;
@@ -1201,7 +1201,7 @@ fn searchInput(
     var search = try initSearch(arena.allocator(), &plan, agg_states, writer);
     // `--limit 0` can never produce output, so no thread is started at all.
     const limit_zero = if (plan.limit) |limit| limit == 0 else false;
-    const scan = chooseScan(input, config, &plan, io);
+    const scan = chooseScan(input, config, io);
     if (limit_zero) {
         // Nothing to scan.
     } else if (scan.threads > 1) {
@@ -1520,6 +1520,17 @@ test "GROUP BY" {
     try testing.expectError(error.UngroupedField, searchBytes(arena.allocator(), input, config, undefined));
 }
 
+/// The values of long.jsonl in the test below that aren't a multiple of 3 lines in, as an `in` list.
+fn longExclusions(a: std.mem.Allocator) ![]const u8 {
+    var list: std.ArrayList(u8) = .empty;
+    for (0..300) |index| {
+        if (index % 3 == 0) continue;
+        if (list.items.len > 0) try list.append(a, ',');
+        try list.print(a, "{d}", .{index + 10});
+    }
+    return list.items;
+}
+
 test "several files are read in order as one input" {
     const io = testing.io;
     var arena = std.heap.ArenaAllocator.init(testing.allocator);
@@ -1530,11 +1541,23 @@ test "several files are read in order as one input" {
     // The first file has no trailing newline: its last line must still end before the next file.
     try tmp.dir.writeFile(io, .{ .sub_path = "one.jsonl", .data = "{\"n\":1}\n{\"n\":2}" });
     try tmp.dir.writeFile(io, .{ .sub_path = "two.jsonl", .data = "{\"n\":3}\n" });
+    // Long enough to span many chunks, and without a trailing newline either.
+    var long: std.ArrayList(u8) = .empty;
+    var long_numbered: std.ArrayList(u8) = .empty;
+    for (0..300) |index| {
+        if (index > 0) try long.append(a, '\n');
+        try long.print(a, "{{\"n\":{d}}}", .{index + 10});
+        if (index % 3 == 0) try long_numbered.print(a, "{d}\t{d}\n", .{ index + 1, index + 10 });
+    }
+    try tmp.dir.writeFile(io, .{ .sub_path = "long.jsonl", .data = long.items });
     // testing.tmpDir lives under .zig-cache/tmp in the working directory.
     const dir = try std.fmt.allocPrint(a, ".zig-cache/tmp/{s}/", .{tmp.sub_path});
     const one = try std.mem.concat(a, u8, &.{ dir, "one.jsonl" });
     const two = try std.mem.concat(a, u8, &.{ dir, "two.jsonl" });
     const missing = try std.mem.concat(a, u8, &.{ dir, "missing.jsonl" });
+    const long_path = try std.mem.concat(a, u8, &.{ dir, "long.jsonl" });
+    // Line numbers restart in every file, also after a file without a trailing newline.
+    const numbered = try std.mem.concat(a, u8, &.{ "1\t1\n", long_numbered.items, "1\t3\n" });
 
     const Case = struct { args: []const []const u8, expected: []const u8 };
     const cases = [_]Case{
@@ -1542,6 +1565,8 @@ test "several files are read in order as one input" {
         .{ .args = &.{ "--limit", "3", "n", "gte", "2", "--file", two, one }, .expected = "{\"n\":3}\n{\"n\":2}\n" },
         .{ .args = &.{ "--limit", "2", "n", "exists", one, two }, .expected = "{\"n\":1}\n{\"n\":2}\n" },
         .{ .args = &.{ "SELECT", "sum:n,count:n", one, two }, .expected = "6\t3\n" },
+        .{ .args = &.{ "-n", "n", "exists", one, two }, .expected = "1:{\"n\":1}\n2:{\"n\":2}\n1:{\"n\":3}\n" },
+        .{ .args = &.{ "-n", "SELECT", "n", "WHERE", "n", "in", "1,3", "OR", "n", "gte", "10", "AND", "NOT", "n", "in", try longExclusions(a), one, long_path, two }, .expected = numbered },
     };
     // One line per block, so the files span several chunks, on one thread and on several.
     const Variant = struct { block_size: usize, threads: usize };

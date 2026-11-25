@@ -351,19 +351,20 @@ jsift --file demo.jsonl SELECT count:name WHERE tier gte 2
 # 4
 
 jsift --file demo.jsonl SELECT min:age,max:balance WHERE active eq true
-# 25.0000 5000.0000
+# 25      5000
 
 jsift --file demo.jsonl SELECT count:name,sum:balance,avg:age,min:age,max:tier WHERE active eq true
-# 4       5200.4900       36.2500 25.0000 5.0000
+# 4       5200.49 36.25   25      5
 
 jsift --file demo.jsonl --format json SELECT count:name,sum:balance WHERE tier gte 2
-# {"count:name": 4, "sum:balance": 5049.7400}
+# {"count:name": 4, "sum:balance": 5049.74}
 
 cat demo.jsonl | jsift SELECT sum:balance
-# 5150.2400
+# 5150.24
 ```
 
 - All aggregates are computed in one pass, each field independently.
+- Results print in their shortest form. Sums, minimums and maximums of integers are exact, at any size. Other results are rounded to 15 significant digits, so `0.1 + 0.2` sums to `0.3`.
 - Numbers stored as strings (`"99.99"`) are included. Values that aren't JSON numbers (`"abc"`, `"nan"`, `"inf"`) are skipped.
 - If `SELECT` contains **any** aggregate, jsift prints one summary row at the end. Plain fields in that row come out empty (TSV/CSV) or `null` (JSON): `SELECT name,count:name` prints an empty column, then `4`.
 

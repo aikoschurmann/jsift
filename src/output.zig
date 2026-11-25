@@ -31,16 +31,106 @@ pub fn jsonEscapeAlloc(allocator: std.mem.Allocator, text: []const u8, quoted: b
     return allocating.toOwnedSlice();
 }
 
+/// A running sum. It stays exact while every value is an integer, and switches to
+/// compensated (Neumaier) summation once a fraction appears, so 0.1 + 0.2 sums to 0.3.
+pub const Sum = struct {
+    /// Exact sum of the integers. An i128 can't overflow: it would take 2^64 values of i64.
+    int: i128 = 0,
+    all_int: bool = true,
+    float: f64 = 0,
+    /// The low-order bits that `float` lost, added back at the end.
+    compensation: f64 = 0,
+    count: usize = 0,
+
+    fn add(self: *Sum, number: f64, int: ?i64) void {
+        if (int) |int_value| self.int += int_value else self.all_int = false;
+        const next = self.float + number;
+        // An infinity would turn the compensation into nan. The sum is infinite anyway.
+        if (std.math.isFinite(next)) {
+            if (@abs(self.float) >= @abs(number)) {
+                self.compensation += (self.float - next) + number;
+            } else {
+                self.compensation += (number - next) + self.float;
+            }
+        }
+        self.float = next;
+        self.count += 1;
+    }
+
+    fn total(self: Sum) Number {
+        return if (self.all_int) .{ .int = self.int } else .{ .float = self.float + self.compensation };
+    }
+
+    fn mean(self: Sum) f64 {
+        const sum: f64 = if (self.all_int) @floatFromInt(self.int) else self.float + self.compensation;
+        return sum / @as(f64, @floatFromInt(self.count));
+    }
+};
+
+/// The smallest or largest number seen so far. Integers are kept exactly, so integers above
+/// 2^53 neither compare nor print rounded.
+pub const Extreme = struct {
+    value: f64 = 0,
+    int: ?i64 = null,
+    seen: bool = false,
+
+    /// Whether `number` comes before the current value: smaller for min, larger for max.
+    fn before(self: Extreme, number: f64, int: ?i64, comptime is_min: bool) bool {
+        if (int != null and self.int != null) {
+            return if (is_min) int.? < self.int.? else int.? > self.int.?;
+        }
+        return if (is_min) number < self.value else number > self.value;
+    }
+
+    fn add(self: *Extreme, number: f64, int: ?i64, comptime is_min: bool) void {
+        if (!self.seen or self.before(number, int, is_min)) {
+            self.* = .{ .value = number, .int = int, .seen = true };
+        }
+    }
+
+    fn result(self: Extreme) Number {
+        return if (self.int) |int_value| .{ .int = int_value } else .{ .float = self.value };
+    }
+};
+
+/// An aggregation result, printed by `writeNumber`.
+const Number = union(enum) { int: i128, float: f64 };
+
+/// Writes a number in its shortest form: integers without a fraction (`5`, not `5.0000`),
+/// other values rounded to 15 significant digits, the most an f64 holds for any decimal, so
+/// float noise doesn't show (0.1 + 0.2 prints `0.3`). Very large or small magnitudes use
+/// exponent notation.
+fn writeNumber(writer: *std.Io.Writer, number: Number) !void {
+    switch (number) {
+        .int => |int_value| try writer.print("{d}", .{int_value}),
+        .float => |exact| {
+            if (!std.math.isFinite(exact)) return writer.print("{d}", .{exact});
+            // Round to 15 significant digits by printing them and reading them back. The
+            // shortest form of the result then has no digits beyond those 15.
+            var digits_buf: [32]u8 = undefined;
+            const digits = std.fmt.bufPrint(&digits_buf, "{e:.14}", .{exact}) catch unreachable;
+            const value = std.fmt.parseFloat(f64, digits) catch unreachable;
+            const magnitude = @abs(value);
+            if (value == @floor(value) and magnitude < 9007199254740992.0) {
+                // Whole numbers below 2^53 are exact integers. This also turns -0 into 0.
+                try writer.print("{d}", .{@as(i64, @intFromFloat(value))});
+            } else if (magnitude >= 1e-6 and magnitude < 1e21) {
+                try writer.print("{d}", .{value});
+            } else {
+                try writer.print("{e}", .{value});
+            }
+        },
+    }
+}
+
 /// The running state of one SELECT field. `raw` fields are plain values, not aggregations.
 pub const AggState = union(enum) {
     raw: void,
     count: usize,
-    sum: f64,
-    /// Starts at +inf, so it stays +inf until a number is seen.
-    min: f64,
-    /// Starts at -inf, so it stays -inf until a number is seen.
-    max: f64,
-    avg: struct { sum: f64, count: usize },
+    sum: Sum,
+    min: Extreme,
+    max: Extreme,
+    avg: Sum,
 };
 
 /// Writes one byte inside a CSV quoted field. A quote is doubled, which is CSV's escape.
@@ -184,33 +274,25 @@ pub fn printFormatted(
 
 /// Writes one aggregation value. An aggregation with nothing folded in has no value: it is
 /// `null` in JSON (`with_nulls`) and an empty field in TSV and CSV. A sum of nothing is 0.
-/// min and max are checked against their +inf and -inf starting values for the same reason.
 inline fn formatAggValue(state: AggState, comptime with_nulls: bool, writer: *std.Io.Writer) !void {
     switch (state) {
         .raw => {
             if (with_nulls) try writer.writeAll("null");
         },
         .count => |count| try writer.print("{d}", .{count}),
-        .sum => |sum| try writer.print("{d:.4}", .{sum}),
-        .min => |min_value| {
-            if (min_value == std.math.inf(f64)) {
-                if (with_nulls) try writer.writeAll("null");
-            } else {
-                try writer.print("{d:.4}", .{min_value});
-            }
-        },
-        .max => |max_value| {
-            if (max_value == -std.math.inf(f64)) {
-                if (with_nulls) try writer.writeAll("null");
-            } else {
-                try writer.print("{d:.4}", .{max_value});
+        .sum => |sum| try writeNumber(writer, sum.total()),
+        .min, .max => |extreme| {
+            if (extreme.seen) {
+                try writeNumber(writer, extreme.result());
+            } else if (with_nulls) {
+                try writer.writeAll("null");
             }
         },
         .avg => |avg| {
-            if (avg.count == 0) {
-                if (with_nulls) try writer.writeAll("null");
-            } else {
-                try writer.print("{d:.4}", .{avg.sum / @as(f64, @floatFromInt(avg.count))});
+            if (avg.count > 0) {
+                try writeNumber(writer, .{ .float = avg.mean() });
+            } else if (with_nulls) {
+                try writer.writeAll("null");
             }
         },
     }
@@ -279,15 +361,12 @@ pub fn accumulate(state: *AggState, value: Value, scratch: *values.Scratch) !voi
             else
                 value.raw;
             const number = values.parseNumber(text) orelse return;
+            const int = values.parseFastInt(text);
 
             switch (state.*) {
-                .sum => |*sum| sum.* += number,
-                .min => |*min_value| min_value.* = @min(min_value.*, number),
-                .max => |*max_value| max_value.* = @max(max_value.*, number),
-                .avg => |*avg| {
-                    avg.sum += number;
-                    avg.count += 1;
-                },
+                .sum, .avg => |*sum| sum.add(number, int),
+                .min => |*extreme| extreme.add(number, int, true),
+                .max => |*extreme| extreme.add(number, int, false),
                 .raw, .count => unreachable,
             }
         },

@@ -443,10 +443,10 @@ fn searchInput(
         agg_states[index] = switch (pluck.ptype) {
             .raw => .raw,
             .count => .{ .count = 0 },
-            .sum => .{ .sum = 0.0 },
-            .min => .{ .min = std.math.inf(f64) },
-            .max => .{ .max = -std.math.inf(f64) },
-            .avg => .{ .avg = .{ .sum = 0.0, .count = 0 } },
+            .sum => .{ .sum = .{} },
+            .min => .{ .min = .{} },
+            .max => .{ .max = .{} },
+            .avg => .{ .avg = .{} },
         };
     }
 
@@ -542,8 +542,8 @@ test "README examples" {
     try expectQuery(demo, &.{ "SELECT", "name", "WHERE", "balance", "lt", "n:100" }, "Bob\nCharlie\n");
     try expectQuery(demo, &.{ "SELECT", "name", "WHERE", "active", "eq", "b:true" }, "Alice\nCharlie\nDave\n");
     try expectQuery(demo, &.{ "--count", "tier", "gte", "2" }, "4\n");
-    try expectQuery(demo, &.{ "SELECT", "min:age,max:age", "WHERE", "active", "eq", "true" }, "25.0000\t45.0000\n");
-    try expectQuery(demo, &.{ "--format", "json", "SELECT", "count:name,sum:balance", "WHERE", "tier", "gte", "2" }, "{\"count:name\": 4, \"sum:balance\": 5049.7400}\n");
+    try expectQuery(demo, &.{ "SELECT", "min:age,max:age", "WHERE", "active", "eq", "true" }, "25\t45\n");
+    try expectQuery(demo, &.{ "--format", "json", "SELECT", "count:name,sum:balance", "WHERE", "tier", "gte", "2" }, "{\"count:name\": 4, \"sum:balance\": 5049.74}\n");
     try expectQuery(demo, &.{ "--limit", "2", "SELECT", "name", "WHERE", "active", "eq", "true" }, "Alice\nCharlie\n");
     try expectQuery(demo, &.{ "--header", "SELECT", "name,tier", "WHERE", "balance", "lt", "100" }, "name\ttier\nBob\t2\nCharlie\t3\nEve\t5\n");
 }
@@ -633,8 +633,21 @@ test "integers beyond i64 compare correctly" {
 }
 
 test "non-numbers are not treated as numbers" {
-    try expectQuery("{\"v\":\"nan\"}\n{\"v\":\"inf\"}\n{\"v\":\"0x10\"}\n{\"v\":3}\n", &.{ "SELECT", "sum:v,count:v" }, "3.0000\t4\n");
+    try expectQuery("{\"v\":\"nan\"}\n{\"v\":\"inf\"}\n{\"v\":\"0x10\"}\n{\"v\":3}\n", &.{ "SELECT", "sum:v,count:v" }, "3\t4\n");
     try expectQuery("{\"v\":\"inf\"}\n", &.{ "--count", "v", "gt", "0" }, "0\n");
+}
+
+test "aggregates print exact, shortest numbers" {
+    // Integers stay exact past 2^53, in sums and in min/max.
+    try expectQuery("{\"n\":1152921504606846976}\n{\"n\":1}\n", &.{ "SELECT", "sum:n,max:n,min:n" }, "1152921504606846977\t1152921504606846976\t1\n");
+    try expectQuery("{\"n\":9007199254740993}\n{\"n\":9007199254740992}\n", &.{ "SELECT", "max:n,min:n" }, "9007199254740993\t9007199254740992\n");
+    // Compensated summation: 0.1 + 0.2 is 0.3, not 0.30000000000000004.
+    try expectQuery("{\"b\":0.1}\n{\"b\":0.2}\n", &.{ "SELECT", "sum:b,avg:b" }, "0.3\t0.15\n");
+    try expectQuery("{\"b\":1}\n{\"b\":2}\n", &.{ "SELECT", "avg:b,min:b" }, "1.5\t1\n");
+    try expectQuery("{\"b\":1}\n{\"b\":1}\n{\"b\":2}\n", &.{ "SELECT", "avg:b" }, "1.33333333333333\n");
+    try expectQuery("{\"b\":2.0}\n{\"b\":-0.0}\n", &.{ "SELECT", "sum:b,min:b" }, "2\t0\n");
+    try expectQuery("{\"b\":1e300}\n{\"b\":1e-9}\n", &.{ "SELECT", "max:b,min:b" }, "1e300\t1e-9\n");
+    try expectQuery("{\"b\":1e400}\n{\"b\":1}\n", &.{ "SELECT", "sum:b" }, "inf\n");
 }
 
 test "limit 0 outputs nothing" {

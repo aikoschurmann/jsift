@@ -228,6 +228,8 @@ pub fn parseArgs(allocator: std.mem.Allocator, args: []const []const u8) !Comman
         } else if (std.mem.eql(u8, arg, "--file")) {
             arg_index += 1;
             if (arg_index == args.len) return error.MissingFileValue;
+            // Only one input is read. A second --file would silently replace the first.
+            if (config.file_path != null) return error.DuplicateFile;
             config.file_path = args[arg_index];
         } else if (std.mem.eql(u8, arg, "--limit")) {
             arg_index += 1;
@@ -292,6 +294,7 @@ test "parseArgs flags and errors" {
     try std.testing.expectError(error.MissingArguments, parseArgs(allocator, &.{}));
     try std.testing.expectEqual(Command.help, try parseArgs(allocator, &.{ "a", "--help" }));
     try std.testing.expectEqual(Command.version, try parseArgs(allocator, &.{ "-V", "a", "exists" }));
+    try std.testing.expectError(error.DuplicateFile, parseArgs(allocator, &.{ "--file", "a", "--file", "b", "a", "exists" }));
     try std.testing.expectError(error.InvertOption, parseArgs(allocator, &.{ "-v", "a", "exists" }));
 
     // `--` lets query terms start with dashes; negative numbers never needed it.

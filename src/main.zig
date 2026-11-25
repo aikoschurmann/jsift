@@ -19,6 +19,7 @@ pub fn main(init: std.process.Init) u8 {
     const command = cli.parseArgs(allocator, args.items) catch |err| {
         const msg = switch (err) {
             error.MissingFileValue => "jsift: --file needs a path",
+            error.DuplicateFile => "jsift: --file can only be given once",
             error.MissingLimitValue => "jsift: --limit needs a number",
             error.InvalidLimit => "jsift: --limit must be a non-negative integer",
             error.MissingFormatValue => "jsift: --format needs json, csv or tsv",

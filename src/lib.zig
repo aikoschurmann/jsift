@@ -97,6 +97,7 @@ fn query(
 
 fn errorMessage(err: anyerror, file_path: ?[*:0]const u8) []const u8 {
     return switch (err) {
+        error.MissingFileValue, error.DuplicateFile => "--file is not supported here",
         error.MissingLimitValue => "--limit needs a number",
         error.InvalidLimit => "--limit must be a non-negative integer",
         error.MissingFormatValue => "--format needs json, csv or tsv",

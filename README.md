@@ -203,6 +203,8 @@ echo '{"id": 5, "user": {"id": 10}, "a.b": 1}' | jsift id eq 10         # doesn'
 echo '{"id": 5, "user": {"id": 10}, "a.b": 1}' | jsift 'a\.b' exists     # matches
 ```
 
+Keys may share a name with a keyword: `SELECT` and `NOT` count as keywords only when the next token isn't an operator, so `jsift select eq 1` and `jsift not exists` test the keys `select` and `not`. A `SELECT` field named `where` needs a trailing comma (`SELECT where,`), since a lone `WHERE` ends the field list.
+
 When a key appears twice in the same object, the last one counts, as in `jq`. Lines that aren't valid JSON never match, not even `NOT` conditions.
 
 Prefix a condition with `NOT` to negate it. `AND` binds tighter than `OR`, and there are no parentheses:

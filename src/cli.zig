@@ -93,6 +93,12 @@ fn parseOp(op_str: []const u8) ?Operator {
     return null;
 }
 
+/// Whether `tokens[index]` exists and is an operator. A keyword (`SELECT`, `NOT`) directly
+/// followed by an operator is a key instead, so `select eq 1` and `not exists` are conditions.
+fn isOperatorAt(tokens: []const []const u8, index: usize) bool {
+    return index < tokens.len and parseOp(tokens[index]) != null;
+}
+
 const SelectClause = struct {
     fields: []PluckField,
     /// Token index just after the SELECT clause, including the WHERE keyword if present.
@@ -153,7 +159,7 @@ fn parseWhereClause(allocator: std.mem.Allocator, tokens: []const []const u8, st
     var token_index = start;
 
     while (token_index < tokens.len) {
-        if (std.ascii.eqlIgnoreCase(tokens[token_index], "not")) {
+        if (std.ascii.eqlIgnoreCase(tokens[token_index], "not") and !isOperatorAt(tokens, token_index + 1)) {
             negated = !negated;
             token_index += 1;
             continue;
@@ -252,7 +258,9 @@ pub fn parseArgs(allocator: std.mem.Allocator, args: []const []const u8) !Comman
 
     // SELECT, if present, comes first among the query tokens.
     var next_token: usize = 0;
-    if (next_token < tokens.items.len and std.ascii.eqlIgnoreCase(tokens.items[next_token], "select")) {
+    if (next_token < tokens.items.len and std.ascii.eqlIgnoreCase(tokens.items[next_token], "select") and
+        !isOperatorAt(tokens.items, next_token + 1))
+    {
         next_token += 1;
         const select = try parseSelectClause(allocator, tokens.items, next_token);
         config.pluck = select.fields;
@@ -288,6 +296,19 @@ test "parseArgs flags and errors" {
 
     const not_not = (try parseArgs(allocator, &.{ "NOT", "NOT", "a", "exists" })).run;
     try std.testing.expect(!not_not.groups[0].conditions[0].negated);
+
+    // Keywords directly followed by an operator are keys.
+    const select_key = (try parseArgs(allocator, &.{ "select", "eq", "1" })).run;
+    try std.testing.expectEqual(@as(usize, 0), select_key.pluck.len);
+    try std.testing.expectEqualStrings("select", select_key.groups[0].conditions[0].key);
+    const not_key = (try parseArgs(allocator, &.{ "not", "exists" })).run;
+    try std.testing.expectEqualStrings("not", not_key.groups[0].conditions[0].key);
+    try std.testing.expect(!not_key.groups[0].conditions[0].negated);
+    const not_not_key = (try parseArgs(allocator, &.{ "NOT", "not", "eq", "1" })).run;
+    try std.testing.expectEqualStrings("not", not_not_key.groups[0].conditions[0].key);
+    try std.testing.expect(not_not_key.groups[0].conditions[0].negated);
+    const where_key = (try parseArgs(allocator, &.{ "SELECT", "a", "WHERE", "where", "eq", "1" })).run;
+    try std.testing.expectEqualStrings("where", where_key.groups[0].conditions[0].key);
 
     const limit0 = (try parseArgs(allocator, &.{ "--limit", "0", "a", "exists" })).run;
     try std.testing.expectEqual(@as(?usize, 0), limit0.limit);

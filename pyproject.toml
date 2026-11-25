@@ -1,0 +1,30 @@
+[build-system]
+requires = ["setuptools>=69", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "jsift"
+dynamic = ["version"]
+description = "Python bindings for jsift, a blisteringly fast JSONL search engine (SIMD, written in Zig)"
+readme = "python/README.md"
+license = "MIT"
+license-files = ["LICENSE"]
+requires-python = ">=3.9"
+authors = [{ name = "Aiko Schurmann" }]
+keywords = ["json", "jsonl", "ndjson", "search", "query", "logs", "simd", "zig"]
+classifiers = [
+    "Programming Language :: Python :: 3",
+    "Operating System :: MacOS",
+    "Operating System :: POSIX :: Linux",
+    "Topic :: Text Processing",
+    "Topic :: System :: Logging",
+]
+
+[project.urls]
+Homepage = "https://github.com/aikoschurmann/jsift"
+Source = "https://github.com/aikoschurmann/jsift"
+
+[tool.setuptools]
+packages = ["jsift"]
+package-dir = { jsift = "python/jsift" }
+include-package-data = false

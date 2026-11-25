@@ -1,5 +1,5 @@
 # Re-record from a directory holding logs.jsonl (made with the generator under
-# "Reproducing the benchmarks" in the README, 2000000 lines) and a zog binary:
+# "Reproducing the benchmarks" in the README, 2000000 lines) and a jsift binary:
 #   vhs demo.tape
 Output demo.gif
 Set Shell "bash"
@@ -11,7 +11,7 @@ Set Theme "Catppuccin Mocha"
 Set TypingSpeed 30ms
 
 Hide
-Type `export PATH=$PWD:$PATH PS1='$ ' TIMEFORMAT='took %Rs' && zog --file logs.jsonl -c level eq error >/dev/null && clear`
+Type `export PATH=$PWD:$PATH PS1='$ ' TIMEFORMAT='took %Rs' && jsift --file logs.jsonl -c level eq error >/dev/null && clear`
 Enter
 Sleep 500ms
 Show
@@ -27,12 +27,12 @@ Hide
 Sleep 9s
 Show
 Sleep 1.5s
-Type `time zog --file logs.jsonl -c level eq error`
+Type `time jsift --file logs.jsonl -c level eq error`
 Enter
 Sleep 2.5s
-Type `zog --file logs.jsonl --limit 3 SELECT ts,service,latency_ms WHERE level eq error AND status gte 500`
+Type `jsift --file logs.jsonl --limit 3 SELECT ts,service,latency_ms WHERE level eq error AND status gte 500`
 Enter
 Sleep 2.5s
-Type `zog --file logs.jsonl --format json SELECT count:bytes,avg:latency_ms WHERE service eq auth AND status eq 200`
+Type `jsift --file logs.jsonl --format json SELECT count:bytes,avg:latency_ms WHERE service eq auth AND status eq 200`
 Enter
 Sleep 4s

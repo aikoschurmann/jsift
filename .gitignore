@@ -1,6 +1,14 @@
 zig-out/
 .zig-cache/
-zog
+/jsift
+/zog
 main2.py
 sad.txt
 *.jsonl
+build/
+dist/
+*.egg-info/
+__pycache__/
+.venv/
+python/jsift/libjsift.*
+.DS_Store

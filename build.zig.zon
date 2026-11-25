@@ -1,6 +1,6 @@
 .{
-    .name = .zog,
-    .fingerprint = 0x9794b707d4c1e01a,
+    .name = .jsift,
+    .fingerprint = 0x4fe31e28e4faa324,
     .version = "2.0.1",
     .minimum_zig_version = "0.16.0",
     .dependencies = .{},

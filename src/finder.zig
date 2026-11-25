@@ -157,7 +157,7 @@ inline fn skipSpaceBackward(hay: []const u8, pos: usize) usize {
 }
 
 /// Escapes that can hide a needle from the byte search. The search compares escaped text,
-/// and every character has exactly one escaped form as zog writes it, except that any
+/// and every character has exactly one escaped form as jsift writes it, except that any
 /// character may also be written `\uXXXX` and '/' may be written `\/`. Such an escape only
 /// matters if it stands for a character some needle contains. A line with one of those is
 /// never ruled out by the byte search.

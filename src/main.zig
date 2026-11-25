@@ -18,17 +18,17 @@ pub fn main(init: std.process.Init) u8 {
 
     const command = cli.parseArgs(allocator, args.items) catch |err| {
         const msg = switch (err) {
-            error.MissingFileValue => "zog: --file needs a path",
-            error.MissingLimitValue => "zog: --limit needs a number",
-            error.InvalidLimit => "zog: --limit must be a non-negative integer",
-            error.MissingFormatValue => "zog: --format needs json, csv or tsv",
-            error.InvalidCondition => "zog: incomplete condition, expected <key> <op> <val>",
-            error.UnknownOperator => "zog: unknown operator (eq, neq, gt, lt, gte, lte, has, exists, in)",
-            error.UnknownOption => "zog: unknown option (put -- before query terms that start with --)",
-            error.MissingArguments => "zog: no query given, expected a condition or SELECT",
-            error.TooManyPluckFields => "zog: too many SELECT fields (max 256)",
-            error.InvalidSelectField => "zog: aggregation needs a field, e.g. sum:balance",
-            error.InvalidFormat => "zog: --format must be json, csv or tsv",
+            error.MissingFileValue => "jsift: --file needs a path",
+            error.MissingLimitValue => "jsift: --limit needs a number",
+            error.InvalidLimit => "jsift: --limit must be a non-negative integer",
+            error.MissingFormatValue => "jsift: --format needs json, csv or tsv",
+            error.InvalidCondition => "jsift: incomplete condition, expected <key> <op> <val>",
+            error.UnknownOperator => "jsift: unknown operator (eq, neq, gt, lt, gte, lte, has, exists, in)",
+            error.UnknownOption => "jsift: unknown option (put -- before query terms that start with --)",
+            error.MissingArguments => "jsift: no query given, expected a condition or SELECT",
+            error.TooManyPluckFields => "jsift: too many SELECT fields (max 256)",
+            error.InvalidSelectField => "jsift: aggregation needs a field, e.g. sum:balance",
+            error.InvalidFormat => "jsift: --format must be json, csv or tsv",
             error.OutOfMemory => return outOfMemory(),
         };
         std.debug.print("{s}\n\n", .{msg});
@@ -44,7 +44,7 @@ pub fn main(init: std.process.Init) u8 {
         .version => {
             var ver_buf: [64]u8 = undefined;
             var ver_writer = std.Io.File.stdout().writerStreaming(io, &ver_buf);
-            ver_writer.interface.print("zog v{s}\n", .{version}) catch {};
+            ver_writer.interface.print("jsift v{s}\n", .{version}) catch {};
             ver_writer.interface.flush() catch {};
             return 0;
         },
@@ -54,14 +54,14 @@ pub fn main(init: std.process.Init) u8 {
     // Without --file the input is stdin. A terminal would wait for typed input, so refuse it.
     if (config.file_path == null) {
         if (std.Io.File.stdin().isTty(io) catch false) {
-            std.debug.print("zog: no input: pass --file <path> or pipe data in\n", .{});
+            std.debug.print("jsift: no input: pass --file <path> or pipe data in\n", .{});
             return 2;
         }
     }
 
     // A 128 KiB buffer keeps the number of write calls small.
     var stdout_buffer: [128 * 1024]u8 = undefined;
-    // Streaming rather than positional, so `zog ... >> out` appends instead of overwriting
+    // Streaming rather than positional, so `jsift ... >> out` appends instead of overwriting
     // the file from offset 0.
     var stdout_writer = std.Io.File.stdout().writerStreaming(io, &stdout_buffer);
     const stdout = &stdout_writer.interface;
@@ -71,17 +71,17 @@ pub fn main(init: std.process.Init) u8 {
             error.WriteFailed => {
                 // `WriteFailed` only says that a write failed. The OS error is kept in `err`.
                 const write_err = stdout_writer.err orelse error.WriteFailed;
-                // The reader went away (e.g. `zog ... | head -1`): not an error for us.
+                // The reader went away (e.g. `jsift ... | head -1`): not an error for us.
                 if (write_err == error.BrokenPipe) return 0;
-                std.debug.print("zog: write error: {s}\n", .{@errorName(write_err)});
+                std.debug.print("jsift: write error: {s}\n", .{@errorName(write_err)});
             },
-            error.NonNumericComparison => std.debug.print("zog: gt, lt, gte and lte need a numeric value.\n", .{}),
-            error.InvalidKey => std.debug.print("zog: keys can't be empty or have empty path segments.\n", .{}),
-            error.FileNotFound => std.debug.print("zog: {s}: No such file\n", .{config.file_path.?}),
+            error.NonNumericComparison => std.debug.print("jsift: gt, lt, gte and lte need a numeric value.\n", .{}),
+            error.InvalidKey => std.debug.print("jsift: keys can't be empty or have empty path segments.\n", .{}),
+            error.FileNotFound => std.debug.print("jsift: {s}: No such file\n", .{config.file_path.?}),
             else => if (config.file_path) |path|
-                std.debug.print("zog: {s}: {s}\n", .{ path, @errorName(err) })
+                std.debug.print("jsift: {s}: {s}\n", .{ path, @errorName(err) })
             else
-                std.debug.print("zog: {s}\n", .{@errorName(err)}),
+                std.debug.print("jsift: {s}\n", .{@errorName(err)}),
         }
         return 2;
     };
@@ -100,7 +100,7 @@ fn runQuery(allocator: std.mem.Allocator, config: cli.Config, stdout: *std.Io.Wr
 }
 
 fn outOfMemory() u8 {
-    std.debug.print("zog: out of memory\n", .{});
+    std.debug.print("jsift: out of memory\n", .{});
     return 2;
 }
 

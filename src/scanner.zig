@@ -11,7 +11,7 @@ const output = @import("output.zig");
 
 const block_size = 8 * 1024 * 1024;
 /// Pipe input is handed over in small blocks: the consumer then scans data the reader just
-/// copied while it is still in L2. Measured ~20% faster than full blocks for `cat | zog`.
+/// copied while it is still in L2. Measured ~20% faster than full blocks for `cat | jsift`.
 const stream_block_size = 128 * 1024;
 
 const Search = struct {
@@ -409,10 +409,27 @@ pub fn searchStream(allocator: std.mem.Allocator, config: cli.Config, writer: *s
     return try searchOpenFile(allocator, std.Io.File.stdin(), config, writer, io);
 }
 
+/// Runs the query on input already in memory (used by the library API). No reader thread.
+pub fn searchBytes(allocator: std.mem.Allocator, data: []const u8, config: cli.Config, writer: *std.Io.Writer) !usize {
+    return try searchInput(allocator, .{ .bytes = data }, config, writer, undefined);
+}
+
 /// Runs the query on an open file and writes its output. Returns the number of matching lines.
 fn searchOpenFile(
     allocator: std.mem.Allocator,
     file: std.Io.File,
+    config: cli.Config,
+    writer: *std.Io.Writer,
+    io: std.Io,
+) !usize {
+    return try searchInput(allocator, .{ .file = file }, config, writer, io);
+}
+
+const Input = union(enum) { file: std.Io.File, bytes: []const u8 };
+
+fn searchInput(
+    allocator: std.mem.Allocator,
+    input: Input,
     config: cli.Config,
     writer: *std.Io.Writer,
     io: std.Io,
@@ -450,7 +467,10 @@ fn searchOpenFile(
     };
     // `--limit 0` can never produce output, so the reader thread is not started at all.
     const limit_zero = if (plan.limit) |limit| limit == 0 else false;
-    if (!limit_zero) try runSearch(&search, file, io);
+    if (!limit_zero) switch (input) {
+        .file => |file| try runSearch(&search, file, io),
+        .bytes => |data| _ = try search.scanBlock(data),
+    };
 
     if (plan.count_only) {
         try writer.print("{d}\n", .{search.match_count});
@@ -488,6 +508,10 @@ fn expectQuery(input: []const u8, args: []const []const u8, expected: []const u8
     const a = arena.allocator();
     const config = (try cli.parseArgs(a, args)).run;
     try testing.expectEqualStrings(expected, try runTestQuery(a, input, config));
+    // The in-memory path (used by the library) gives the same output as the file path.
+    var bytes_out: std.Io.Writer.Allocating = .init(a);
+    _ = try searchBytes(a, input, config, &bytes_out.writer);
+    try testing.expectEqualStrings(expected, bytes_out.written());
     if (!config.fast) {
         // The prefilter never changes the result.
         var unfiltered = config;

@@ -1,0 +1,4 @@
+include build.zig build.zig.zon LICENSE
+recursive-include src *.zig
+include python/README.md
+recursive-include python/tests *.py

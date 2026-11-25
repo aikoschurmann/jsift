@@ -24,16 +24,52 @@ jobs:
       - name: Build Linux (x86_64)
         run: |
           zig build -Doptimize=ReleaseFast -Dtarget=x86_64-linux
-          mv zig-out/bin/zog zog-linux-amd64
+          mv zig-out/bin/jsift jsift-linux-amd64
 
       - name: Build macOS (Apple Silicon)
         run: |
           zig build -Doptimize=ReleaseFast -Dtarget=aarch64-macos
-          mv zig-out/bin/zog zog-macos-arm64
+          mv zig-out/bin/jsift jsift-macos-arm64
 
       - name: Create GitHub Release
         uses: softprops/action-gh-release@v2
         with:
           files: |
-            zog-linux-amd64
-            zog-macos-arm64
+            jsift-linux-amd64
+            jsift-macos-arm64
+
+  pypi:
+    name: Python wheels & PyPI
+    runs-on: ubuntu-latest
+    environment: pypi
+    permissions:
+      # Trusted publishing: no API token needed.
+      id-token: write
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Setup Zig
+        uses: goto-bus-stop/setup-zig@v2
+        with:
+          version: 0.16.0
+          use-cache: false
+
+      - name: Setup Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+
+      - name: Build wheels for every platform (cross-compiled by Zig) and the sdist
+        run: |
+          pip install build setuptools wheel pytest
+          python python/build_wheels.py --out dist
+
+      - name: Test the Linux x86_64 wheel
+        run: |
+          pip install dist/*manylinux_2_17_x86_64.whl
+          cd /tmp && python -m pytest -q "$GITHUB_WORKSPACE/python/tests"
+
+      - name: Publish to PyPI
+        uses: pypa/gh-action-pypi-publish@release/v1

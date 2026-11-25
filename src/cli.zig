@@ -41,9 +41,9 @@ pub const Command = union(enum) {
 
 pub fn printUsage() void {
     std.debug.print(
-        \\zog - search JSONL with SIMD
+        \\jsift - search JSONL with SIMD
         \\
-        \\Usage: zog [--file <path>] [--format json|csv|tsv] [SELECT <fields> WHERE] <key> <op> <val> [AND/OR ...]
+        \\Usage: jsift [--file <path>] [--format json|csv|tsv] [SELECT <fields> WHERE] <key> <op> <val> [AND/OR ...]
         \\
         \\Options:
         \\  --file <path>       Path to JSONL file (reads from stdin if omitted)
@@ -72,10 +72,10 @@ pub fn printUsage() void {
         \\  2  Error
         \\
         \\Examples:
-        \\  zog --file logs.jsonl level eq error
-        \\  zog --file logs.jsonl level in error,critical,warn
-        \\  zog --file data.jsonl SELECT name,age
-        \\  cat data.jsonl | zog SELECT name,sum:balance WHERE active eq b:true
+        \\  jsift --file logs.jsonl level eq error
+        \\  jsift --file logs.jsonl level in error,critical,warn
+        \\  jsift --file data.jsonl SELECT name,age
+        \\  cat data.jsonl | jsift SELECT name,sum:balance WHERE active eq b:true
         \\
     , .{});
 }

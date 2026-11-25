@@ -9,11 +9,6 @@ const values = @import("values.zig");
 const match = @import("match.zig");
 const output = @import("output.zig");
 
-const block_size = 8 * 1024 * 1024;
-/// Pipe input is handed over in small blocks: the consumer then scans data the reader just
-/// copied while it is still in L2. Measured ~20% faster than full blocks for `cat | jsift`.
-const stream_block_size = 128 * 1024;
-
 const Search = struct {
     plan: *const compile.CompiledPlan,
     agg_states: []output.AggState,
@@ -303,6 +298,8 @@ const ReaderCtx = struct {
     /// Input is a pipe or terminal: hand data over as soon as nothing more is immediately
     /// readable instead of waiting for a full block.
     streaming: bool,
+    /// Bytes per block: `Config.block_size`, or `Config.stream_block_size` when streaming.
+    block_size: usize,
 
     bufs: [2]Buffer,
 
@@ -336,7 +333,7 @@ fn fillBuffer(ctx: *ReaderCtx, buf: *Buffer, total: *usize) bool {
 
         total.* += read_len;
         // Streaming input: stop once a small block is full or the pipe has no more data right now.
-        const block_full = total.* >= stream_block_size;
+        const block_full = total.* >= ctx.block_size;
         if (ctx.streaming and (block_full or !dataReady(ctx.file))) return false;
     }
     return false;
@@ -362,8 +359,8 @@ fn readerThread(ctx: *ReaderCtx) void {
 
         // Make room for the carry plus at least half a block of fresh data. Growing
         // only when this fails keeps the common path free of reallocations.
-        if (carry.len + block_size / 2 > buf.data.len) {
-            growBuffer(buf, carry.len + block_size) catch |err| {
+        if (carry.len + ctx.block_size / 2 > buf.data.len) {
+            growBuffer(buf, carry.len + ctx.block_size) catch |err| {
                 // Report the failure through the same path as end of input so the consumer
                 // exits instead of waiting for a buffer that will never come.
                 ctx.read_err = err;
@@ -431,7 +428,7 @@ fn consume(search: *Search, ctx: *ReaderCtx, io: std.Io) !bool {
 }
 
 /// Returns true when all input was consumed, false when the match limit stopped it early.
-fn runSearch(search: *Search, file: std.Io.File, io: std.Io) !bool {
+fn runSearch(search: *Search, file: std.Io.File, config: cli.Config, io: std.Io) !bool {
     // When we stop early the reader may be blocked in a read that never returns (e.g. on
     // `tail -f`), so it is detached rather than joined. Its context and buffers must then
     // outlive this function, so they come from page_allocator and are freed only after a join.
@@ -441,6 +438,8 @@ fn runSearch(search: *Search, file: std.Io.File, io: std.Io) !bool {
     // If stat fails, assume streaming, which is the safe choice for an unknown source.
     const streaming = if (file.stat(io)) |stat| stat.kind != .file else |_| true;
 
+    const block_size = if (streaming) config.stream_block_size else config.block_size;
+
     const first_data = try page_allocator.alloc(u8, block_size);
     errdefer page_allocator.free(first_data);
     const second_data = try page_allocator.alloc(u8, block_size);
@@ -449,6 +448,7 @@ fn runSearch(search: *Search, file: std.Io.File, io: std.Io) !bool {
         .file = file,
         .io = io,
         .streaming = streaming,
+        .block_size = block_size,
         .bufs = .{ .{ .data = first_data }, .{ .data = second_data } },
     };
     const thread = try std.Thread.spawn(.{}, readerThread, .{ctx});
@@ -558,14 +558,14 @@ fn searchInput(
     // `--limit 0` can never produce output, so the reader thread is not started at all.
     const limit_zero = if (plan.limit) |limit| limit == 0 else false;
     if (!limit_zero) switch (input) {
-        .file => |file| _ = try runSearch(&search, file, io),
+        .file => |file| _ = try runSearch(&search, file, config, io),
         .files => |files| for (files.paths) |path| {
             files.failed.* = path;
             // Line numbers restart in every file, as in grep.
             search.lines_seen = 0;
             const file = try std.Io.Dir.cwd().openFile(io, path, .{});
             defer file.close(io);
-            const finished = try runSearch(&search, file, io);
+            const finished = try runSearch(&search, file, config, io);
             files.failed.* = null;
             if (!finished) break;
         },
@@ -605,16 +605,36 @@ fn runTestQuery(a: std.mem.Allocator, input: []const u8, config: cli.Config) ![]
     return out.written();
 }
 
+/// A block size small enough that `input` spans a few dozen blocks, so that every test also
+/// covers lines split across reads, carried over and longer than a block.
+fn tinyBlockSize(input: []const u8) usize {
+    return @max(16, input.len / 24);
+}
+
+/// The ways of running a query that must all give the same output: whole input in one
+/// block, and tiny blocks. Each variant is run on a file and on bytes in memory.
+fn testVariants(config: cli.Config, input: []const u8) [2]cli.Config {
+    var tiny = config;
+    tiny.block_size = tinyBlockSize(input);
+    tiny.stream_block_size = tiny.block_size;
+    return .{ config, tiny };
+}
+
+/// Runs `config` through the file path and the in-memory path (used by the library) and
+/// checks that both print `expected`.
+fn expectBothPaths(a: std.mem.Allocator, input: []const u8, config: cli.Config, expected: []const u8) !void {
+    try testing.expectEqualStrings(expected, try runTestQuery(a, input, config));
+    var bytes_out: std.Io.Writer.Allocating = .init(a);
+    _ = try searchBytes(a, input, config, &bytes_out.writer);
+    try testing.expectEqualStrings(expected, bytes_out.written());
+}
+
 fn expectQuery(input: []const u8, args: []const []const u8, expected: []const u8) !void {
     var arena = std.heap.ArenaAllocator.init(testing.allocator);
     defer arena.deinit();
     const a = arena.allocator();
     const config = (try cli.parseArgs(a, args)).run;
-    try testing.expectEqualStrings(expected, try runTestQuery(a, input, config));
-    // The in-memory path (used by the library) gives the same output as the file path.
-    var bytes_out: std.Io.Writer.Allocating = .init(a);
-    _ = try searchBytes(a, input, config, &bytes_out.writer);
-    try testing.expectEqualStrings(expected, bytes_out.written());
+    for (testVariants(config, input)) |variant| try expectBothPaths(a, input, variant, expected);
     if (!config.fast) {
         // The prefilter never changes the result.
         var unfiltered = config;
@@ -845,7 +865,7 @@ test "line numbers" {
     const a = arena.allocator();
     var big: std.ArrayList(u8) = .empty;
     // Lines are 17 bytes: {"i":1000000000} and a newline.
-    const line_count = 2 * block_size / 17;
+    const line_count = 2 * cli.default_block_size / 17;
     for (0..line_count) |index| try big.print(a, "{{\"i\":{d}}}\n", .{1_000_000_000 + index});
     const config = (try cli.parseArgs(a, &.{ "-n", "SELECT", "i", "WHERE", "i", "gte", "1000600000" })).run;
     const out = try runTestQuery(a, big.items, config);
@@ -914,7 +934,7 @@ test "last line without trailing newline is processed" {
 
 test "lines longer than a block are handled" {
     const a = testing.allocator;
-    const big = try a.alloc(u8, block_size + block_size / 2);
+    const big = try a.alloc(u8, cli.default_block_size + cli.default_block_size / 2);
     defer a.free(big);
     @memset(big, 'x');
     const input = try std.mem.concat(a, u8, &.{ "{\"a\":0}\n{\"pad\":\"", big, "\",\"a\":1}\n{\"a\":2}\n{\"a\":3}" });
@@ -930,7 +950,7 @@ test "many blocks with multi-condition and OR plans" {
     var expected_and: usize = 0;
     var expected_or: usize = 0;
     var i: usize = 0;
-    while (list.items.len < 2 * block_size + 12345) : (i += 1) {
+    while (list.items.len < 2 * cli.default_block_size + 12345) : (i += 1) {
         const level = if (i % 7 == 0) "error" else "info";
         const status = 200 + (i % 5) * 100;
         try list.print(a, "{{\"i\":{d},\"level\":\"{s}\",\"status\":{d},\"msg\":\"some text {d}\"}}\n", .{ i, level, status, i });

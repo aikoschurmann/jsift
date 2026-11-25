@@ -39,7 +39,18 @@ pub const Config = struct {
     fast: bool = false,
     /// Rule lines out with the byte-level search before parsing. Only turned off by tests.
     prefilter: bool = true,
+    /// Bytes per block read from a regular file. Not an option: tests shrink it so that
+    /// small inputs span many blocks.
+    block_size: usize = default_block_size,
+    /// Bytes per block read from a pipe or terminal. Not an option, as `block_size`.
+    stream_block_size: usize = default_stream_block_size,
 };
+
+/// Large blocks keep the per-block costs (a read call, a handover) negligible.
+pub const default_block_size = 8 * 1024 * 1024;
+/// Pipe input is handed over in small blocks: the consumer then scans data the reader just
+/// copied while it is still in L2. Measured ~20% faster than full blocks for `cat | jsift`.
+pub const default_stream_block_size = 128 * 1024;
 pub const Command = union(enum) {
     help,
     version,

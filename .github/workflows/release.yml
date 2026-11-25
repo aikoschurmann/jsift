@@ -16,10 +16,9 @@ jobs:
         uses: actions/checkout@v4
 
       - name: Setup Zig
-        uses: goto-bus-stop/setup-zig@v2
+        uses: mlugg/setup-zig@v2
         with:
           version: 0.16.0
-          use-cache: false
 
       - name: Build Linux (x86_64)
         run: |
@@ -51,10 +50,9 @@ jobs:
         uses: actions/checkout@v4
 
       - name: Setup Zig
-        uses: goto-bus-stop/setup-zig@v2
+        uses: mlugg/setup-zig@v2
         with:
           version: 0.16.0
-          use-cache: false
 
       - name: Setup Python
         uses: actions/setup-python@v5

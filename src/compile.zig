@@ -71,6 +71,8 @@ pub const CompiledPlan = struct {
     limit: ?usize,
     count_only: bool,
     header: bool,
+    /// Number each output row. Not for counts and aggregations, which print no rows per line.
+    line_numbers: bool,
 };
 
 /// Splits a key into the path of object keys it names: `a.b` is key `b` inside `a`. `\.`
@@ -394,6 +396,7 @@ pub fn compilePlan(allocator: std.mem.Allocator, config: cli.Config) !CompiledPl
         .limit = config.limit,
         .count_only = config.count_only,
         .header = config.header,
+        .line_numbers = config.line_numbers and !config.count_only and !has_aggregations,
     };
 }
 

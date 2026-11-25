@@ -186,6 +186,7 @@ Files are the terms left over once the query is complete, so `SELECT` fields and
 | `--count`, `-c` | Print only the number of matching lines |
 | `--header` | Print a header row of field names (TSV/CSV) |
 | `--limit <n>` | Stop after `n` matches |
+| `--line-number`, `-n` | Prefix each match with its line number in its file (`12:{...}`). With `SELECT` it is a first column named `line`, or a `"line"` member in JSON. Ignored by `--count` and aggregates |
 | `--fast` | Match on the raw bytes only, without the exact parse: faster, but approximate (see [Limitations](#limitations--trade-offs)) |
 | `--help`, `-h` | Show help |
 | `--version`, `-V` | Show the version (`-v` is rejected, so it can't be mistaken for grep's invert: use `NOT`) |
@@ -411,6 +412,9 @@ tail -f app.jsonl | jsift level eq error
 
 # Stop at the first match, even on a stream that never ends
 tail -f app.jsonl | jsift --limit 1 level eq error
+
+# Line numbers, like grep -n (they restart in every file)
+jsift -n level eq error app.jsonl
 
 # Chain with other tools
 jsift --file demo.jsonl SELECT name WHERE tier gte 3 | sort

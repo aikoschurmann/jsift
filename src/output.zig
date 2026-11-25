@@ -243,15 +243,18 @@ inline fn writeValue(value: Value, comptime format: cli.OutputFormat, writer: *s
 }
 
 /// Writes the SELECT fields of one matching line. A missing field is empty, or `null` in JSON.
+/// With `line_number`, the row starts with it: a first column, or a `"line"` member in JSON.
 pub fn printFormatted(
     results: []const ?Value,
     plucks: []const compile.CompiledPluck,
     format: cli.OutputFormat,
+    line_number: ?usize,
     writer: *std.Io.Writer,
 ) !void {
     switch (format) {
         .json => {
             try writer.writeByte('{');
+            if (line_number) |number| try writer.print("\"line\": {d}{s}", .{ number, if (results.len > 0) ", " else "" });
             for (results, plucks, 0..) |result, pluck, index| {
                 if (index > 0) try writer.writeAll(", ");
                 try writeJsonKey(writer, pluck.original_str);
@@ -261,6 +264,7 @@ pub fn printFormatted(
         },
         inline .csv, .tsv => |row_format| {
             const separator: u8 = if (row_format == .csv) ',' else '\t';
+            if (line_number) |number| try writer.print("{d}{c}", .{ number, separator });
             for (results, 0..) |result, index| {
                 if (index > 0) try writer.writeByte(separator);
                 if (result) |value| try writeValue(value, row_format, writer);
@@ -336,6 +340,7 @@ pub fn printHeader(plan: *const compile.CompiledPlan, writer: *std.Io.Writer) !v
     // JSON output carries field names in every object, so a header line would only corrupt it.
     if (!plan.header or plan.pluck.len == 0 or plan.count_only or plan.format == .json) return;
 
+    if (plan.line_numbers) try writer.writeAll(if (plan.format == .csv) "line," else "line\t");
     for (plan.pluck, 0..) |pluck, index| {
         if (plan.format == .csv) {
             if (index > 0) try writer.writeByte(',');

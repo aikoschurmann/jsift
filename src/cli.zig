@@ -31,6 +31,8 @@ pub const Config = struct {
     limit: ?usize = null,
     count_only: bool = false,
     header: bool = false,
+    /// Prefix each output line with its line number in its file.
+    line_numbers: bool = false,
     /// Evaluate on the raw bytes only, without the exact parse.
     fast: bool = false,
     /// Rule lines out with the byte-level search before parsing. Only turned off by tests.
@@ -55,6 +57,7 @@ pub fn printUsage() void {
         \\  --count, -c         Print only the count of matching lines
         \\  --header            Print column header row (for TSV/CSV with SELECT)
         \\  --limit <n>         Stop after n matches
+        \\  --line-number, -n   Prefix each match with its line number (a "line" column with SELECT)
         \\  --fast              Match on raw bytes only: faster, but approximate (keys at any depth,
         \\                      no escape decoding, no validation)
         \\  --help, -h          Show this help message
@@ -412,6 +415,8 @@ pub fn parseArgs(allocator: std.mem.Allocator, args: []const []const u8) !Comman
             return error.InvertOption;
         } else if (std.mem.eql(u8, arg, "--count") or std.mem.eql(u8, arg, "-c")) {
             config.count_only = true;
+        } else if (std.mem.eql(u8, arg, "--line-number") or std.mem.eql(u8, arg, "-n")) {
+            config.line_numbers = true;
         } else if (std.mem.eql(u8, arg, "--header")) {
             config.header = true;
         } else if (std.mem.eql(u8, arg, "--fast")) {

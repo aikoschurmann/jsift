@@ -30,6 +30,21 @@ const Search = struct {
     /// The encoded key of the current line's group, reused between lines.
     group_key: std.ArrayList(u8) = .empty,
 
+    /// --line-number: the block being scanned, the newlines counted in the file before
+    /// `counted_pos` in it, and that position. Newlines are only counted up to a line that is
+    /// printed, so lines ruled out without being split out cost one SIMD count per block.
+    block: []const u8 = &.{},
+    lines_seen: usize = 0,
+    counted_pos: usize = 0,
+
+    /// The 1-based line number of `line`, which lies in the current block.
+    fn lineNumber(self: *Search, line: []const u8) usize {
+        const line_start = @intFromPtr(line.ptr) - @intFromPtr(self.block.ptr);
+        self.lines_seen += std.mem.count(u8, self.block[self.counted_pos..line_start], "\n");
+        self.counted_pos = line_start;
+        return self.lines_seen + 1;
+    }
+
     /// The aggregation states of the group `line` belongs to, created on first sight. The
     /// key encodes each group value as a type byte, its length and its text, with strings
     /// decoded, so `"a"` and `"\u0061"` share a group but `"1"` and `1` don't.
@@ -81,7 +96,9 @@ const Search = struct {
 
         // Strip one CR so CRLF input prints as LF.
         const line = if (std.mem.endsWith(u8, line_raw, "\r")) line_raw[0 .. line_raw.len - 1] else line_raw;
+        const line_number = if (plan.line_numbers) self.lineNumber(line_raw) else null;
         if (plan.pluck.len == 0) {
+            if (line_number) |number| try self.writer.print("{d}:", .{number});
             try self.writer.writeAll(line);
             try self.writer.writeByte('\n');
             return reached;
@@ -105,7 +122,7 @@ const Search = struct {
                 if (result) |value| try output.accumulate(state, value, &self.scratch);
             }
         } else {
-            try output.printFormatted(results[0..plan.pluck.len], plan.pluck, plan.format, self.writer);
+            try output.printFormatted(results[0..plan.pluck.len], plan.pluck, plan.format, line_number, self.writer);
         }
         return reached;
     }
@@ -113,6 +130,16 @@ const Search = struct {
     /// Processes a block of lines. Every block ends with a newline except possibly the last.
     /// Returns true once the match limit is reached.
     fn scanBlock(self: *Search, data: []const u8) !bool {
+        if (!self.plan.line_numbers) return self.scanBlockLines(data);
+        self.block = data;
+        self.counted_pos = 0;
+        const limit_reached = try self.scanBlockLines(data);
+        // Count the rest of the block, so the next block continues from its last line.
+        self.lines_seen += std.mem.count(u8, data[self.counted_pos..], "\n");
+        return limit_reached;
+    }
+
+    fn scanBlockLines(self: *Search, data: []const u8) !bool {
         const plan = self.plan;
         if (plan.exact) {
             // Exact mode with prefilter gets the anchored scan, which may rule lines out at byte level.
@@ -534,6 +561,8 @@ fn searchInput(
         .file => |file| _ = try runSearch(&search, file, io),
         .files => |files| for (files.paths) |path| {
             files.failed.* = path;
+            // Line numbers restart in every file, as in grep.
+            search.lines_seen = 0;
             const file = try std.Io.Dir.cwd().openFile(io, path, .{});
             defer file.close(io);
             const finished = try runSearch(&search, file, io);
@@ -793,6 +822,35 @@ test "several files are read in order as one input" {
     var failed: ?[]const u8 = null;
     try testing.expectError(error.FileNotFound, searchFiles(a, config, &out.writer, io, &failed));
     try testing.expectEqualStrings(missing, failed.?);
+}
+
+test "line numbers" {
+    try expectQuery(demo, &.{ "-n", "tier", "in", "2,4" },
+        \\2:{"name": "Bob", "age": 30, "balance": -50.25, "active": false, "tier": 2}
+        \\4:{"name": "Dave", "age": 45, "balance": 5000.00, "active": true, "tier": 4}
+        \\
+    );
+    try expectQuery(demo, &.{ "-n", "--header", "SELECT", "name", "WHERE", "age", "eq", "30" }, "line\tname\n2\tBob\n3\tCharlie\n");
+    try expectQuery(demo, &.{ "-n", "--format", "json", "SELECT", "name", "WHERE", "tier", "eq", "5" }, "{\"line\": 5, \"name\": \"Eve\"}\n");
+    try expectQuery(demo, &.{ "-n", "--format", "csv", "SELECT", "name", "WHERE", "NOT", "active", "eq", "true" }, "2,\"Bob\"\n");
+    // Counts and aggregations print no per-line rows, so -n changes nothing.
+    try expectQuery(demo, &.{ "-n", "-c", "tier", "gte", "2" }, "4\n");
+    try expectQuery(demo, &.{ "-n", "SELECT", "count:name" }, "5\n");
+    // Invalid and skipped lines still count, and CRLF ends a line like LF.
+    try expectQuery("junk\r\n{\"a\":1}\r\n\n{\"a\":2}", &.{ "-n", "a", "exists" }, "2:{\"a\":1}\n4:{\"a\":2}\n");
+
+    // Numbers continue across blocks: a big input spans several 8 MB blocks.
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    var big: std.ArrayList(u8) = .empty;
+    // Lines are 17 bytes: {"i":1000000000} and a newline.
+    const line_count = 2 * block_size / 17;
+    for (0..line_count) |index| try big.print(a, "{{\"i\":{d}}}\n", .{1_000_000_000 + index});
+    const config = (try cli.parseArgs(a, &.{ "-n", "SELECT", "i", "WHERE", "i", "gte", "1000600000" })).run;
+    const out = try runTestQuery(a, big.items, config);
+    try testing.expect(std.mem.startsWith(u8, out, "600001\t1000600000\n"));
+    try testing.expect(std.mem.endsWith(u8, out, try std.fmt.allocPrint(a, "{d}\t{d}\n", .{ line_count, 1_000_000_000 + line_count - 1 })));
 }
 
 test "parentheses group conditions" {

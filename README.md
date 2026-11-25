@@ -164,16 +164,24 @@ Most queries run at about 10 GB/s, on par with ripgrep's plain fixed-string coun
 ## Usage
 
 ```text
-jsift [options] [SELECT <fields> [WHERE]] <condition> [AND|OR <condition> ...] [GROUP BY <keys>]
+jsift [options] [SELECT <fields> [WHERE]] <condition> [AND|OR <condition> ...] [GROUP BY <keys>] [<file>...]
 ```
 
-jsift reads the file given with `--file`, or standard input when it is omitted.
+jsift reads the files named after the query or with `--file`, in order, as one input: `--limit`, `--count` and aggregates span all of them. Without files it reads standard input.
+
+```bash
+jsift level eq error app.jsonl
+jsift -c level eq error logs/*.jsonl
+jsift SELECT service,count:id GROUP BY service jan.jsonl feb.jsonl
+```
+
+Files are the terms left over once the query is complete, so `SELECT` fields and `GROUP BY` keys must be joined by commas (`SELECT name,age` or `SELECT name, age`): in `SELECT name age file.jsonl`, `age` would be a file. A missing file is reported by name, with exit code 2, after the files before it were searched.
 
 ### Options
 
 | Option | Meaning |
 |--------|---------|
-| `--file <path>` | JSONL file to read (default: stdin) |
+| `--file <path>` | JSONL file to read; repeatable. Files can also follow the query (default: stdin) |
 | `--format tsv\|csv\|json` | Output format for `SELECT` (default: `tsv`) |
 | `--count`, `-c` | Print only the number of matching lines |
 | `--header` | Print a header row of field names (TSV/CSV) |

@@ -403,7 +403,8 @@ fn consume(search: *Search, ctx: *ReaderCtx, io: std.Io) !bool {
     }
 }
 
-fn runSearch(search: *Search, file: std.Io.File, io: std.Io) !void {
+/// Returns true when all input was consumed, false when the match limit stopped it early.
+fn runSearch(search: *Search, file: std.Io.File, io: std.Io) !bool {
     // When we stop early the reader may be blocked in a read that never returns (e.g. on
     // `tail -f`), so it is detached rather than joined. Its context and buffers must then
     // outlive this function, so they come from page_allocator and are freed only after a join.
@@ -430,12 +431,16 @@ fn runSearch(search: *Search, file: std.Io.File, io: std.Io) !void {
         abandonReader(ctx, thread, io);
         return err;
     };
-    if (!finished) return abandonReader(ctx, thread, io);
+    if (!finished) {
+        abandonReader(ctx, thread, io);
+        return false;
+    }
 
     thread.join();
     page_allocator.free(ctx.bufs[0].data);
     page_allocator.free(ctx.bufs[1].data);
     page_allocator.destroy(ctx);
+    return true;
 }
 
 /// Stops the reader without waiting for it. Setting `stop` and posting `read_sem` wakes a
@@ -447,10 +452,16 @@ fn abandonReader(ctx: *ReaderCtx, thread: std.Thread, io: std.Io) void {
     thread.detach();
 }
 
-pub fn searchFile(allocator: std.mem.Allocator, config: cli.Config, writer: *std.Io.Writer, io: std.Io) !usize {
-    const file = try std.Io.Dir.cwd().openFile(io, config.file_path.?, .{});
-    defer file.close(io);
-    return try searchOpenFile(allocator, file, config, writer, io);
+/// Runs the query over `config.files` in order, as one input: the limit, counts and
+/// aggregates span all of them. When opening or reading a file fails, `failed_path` names it.
+pub fn searchFiles(
+    allocator: std.mem.Allocator,
+    config: cli.Config,
+    writer: *std.Io.Writer,
+    io: std.Io,
+    failed_path: *?[]const u8,
+) !usize {
+    return try searchInput(allocator, .{ .files = .{ .paths = config.files, .failed = failed_path } }, config, writer, io);
 }
 
 pub fn searchStream(allocator: std.mem.Allocator, config: cli.Config, writer: *std.Io.Writer, io: std.Io) !usize {
@@ -473,7 +484,11 @@ fn searchOpenFile(
     return try searchInput(allocator, .{ .file = file }, config, writer, io);
 }
 
-const Input = union(enum) { file: std.Io.File, bytes: []const u8 };
+const Input = union(enum) {
+    file: std.Io.File,
+    files: struct { paths: []const []const u8, failed: *?[]const u8 },
+    bytes: []const u8,
+};
 
 fn searchInput(
     allocator: std.mem.Allocator,
@@ -516,7 +531,15 @@ fn searchInput(
     // `--limit 0` can never produce output, so the reader thread is not started at all.
     const limit_zero = if (plan.limit) |limit| limit == 0 else false;
     if (!limit_zero) switch (input) {
-        .file => |file| try runSearch(&search, file, io),
+        .file => |file| _ = try runSearch(&search, file, io),
+        .files => |files| for (files.paths) |path| {
+            files.failed.* = path;
+            const file = try std.Io.Dir.cwd().openFile(io, path, .{});
+            defer file.close(io);
+            const finished = try runSearch(&search, file, io);
+            files.failed.* = null;
+            if (!finished) break;
+        },
         .bytes => |data| _ = try search.scanBlock(data),
     };
 
@@ -730,6 +753,46 @@ test "GROUP BY" {
     defer arena.deinit();
     const config = (try cli.parseArgs(arena.allocator(), &.{ "SELECT", "svc,ms", "GROUP", "BY", "svc" })).run;
     try testing.expectError(error.UngroupedField, searchBytes(arena.allocator(), input, config, undefined));
+}
+
+test "several files are read in order as one input" {
+    const io = testing.io;
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+    // The first file has no trailing newline: its last line must still end before the next file.
+    try tmp.dir.writeFile(io, .{ .sub_path = "one.jsonl", .data = "{\"n\":1}\n{\"n\":2}" });
+    try tmp.dir.writeFile(io, .{ .sub_path = "two.jsonl", .data = "{\"n\":3}\n" });
+    // testing.tmpDir lives under .zig-cache/tmp in the working directory.
+    const dir = try std.fmt.allocPrint(a, ".zig-cache/tmp/{s}/", .{tmp.sub_path});
+    const one = try std.mem.concat(a, u8, &.{ dir, "one.jsonl" });
+    const two = try std.mem.concat(a, u8, &.{ dir, "two.jsonl" });
+    const missing = try std.mem.concat(a, u8, &.{ dir, "missing.jsonl" });
+
+    const Case = struct { args: []const []const u8, expected: []const u8 };
+    const cases = [_]Case{
+        .{ .args = &.{ "n", "exists", one, two }, .expected = "{\"n\":1}\n{\"n\":2}\n{\"n\":3}\n" },
+        .{ .args = &.{ "--limit", "3", "n", "gte", "2", "--file", two, one }, .expected = "{\"n\":3}\n{\"n\":2}\n" },
+        .{ .args = &.{ "--limit", "2", "n", "exists", one, two }, .expected = "{\"n\":1}\n{\"n\":2}\n" },
+        .{ .args = &.{ "SELECT", "sum:n,count:n", one, two }, .expected = "6\t3\n" },
+    };
+    for (cases) |case| {
+        const config = (try cli.parseArgs(a, case.args)).run;
+        var out: std.Io.Writer.Allocating = .init(a);
+        var failed: ?[]const u8 = null;
+        _ = try searchFiles(a, config, &out.writer, io, &failed);
+        try testing.expectEqualStrings(case.expected, out.written());
+        try testing.expect(failed == null);
+    }
+
+    // A missing file is reported by name, after the earlier files were searched.
+    const config = (try cli.parseArgs(a, &.{ "n", "exists", one, missing, two })).run;
+    var out: std.Io.Writer.Allocating = .init(a);
+    var failed: ?[]const u8 = null;
+    try testing.expectError(error.FileNotFound, searchFiles(a, config, &out.writer, io, &failed));
+    try testing.expectEqualStrings(missing, failed.?);
 }
 
 test "parentheses group conditions" {

@@ -21,7 +21,8 @@ pub const PluckField = struct {
     original_str: []const u8,
 };
 pub const Config = struct {
-    file_path: ?[]const u8 = null,
+    /// Files to read, in order, as one input. Empty means stdin.
+    files: []const []const u8 = &.{},
     groups: []ConditionGroup,
     pluck: []PluckField,
     /// GROUP BY keys: one aggregation row per distinct combination of their values.
@@ -45,10 +46,11 @@ pub fn printUsage() void {
     std.debug.print(
         \\jsift - search JSONL with SIMD
         \\
-        \\Usage: jsift [--file <path>] [--format json|csv|tsv] [SELECT <fields> WHERE] <key> <op> <val> [AND/OR ...] [GROUP BY <keys>]
+        \\Usage: jsift [options] [SELECT <fields> WHERE] <key> <op> <val> [AND/OR ...] [GROUP BY <keys>] [<file>...]
         \\
         \\Options:
-        \\  --file <path>       Path to JSONL file (reads from stdin if omitted)
+        \\  --file <path>       JSONL file to read; repeatable. Files can also follow the query.
+        \\                      Without any, reads stdin.
         \\  --format <type>     Output format: tsv (default), csv, or json
         \\  --count, -c         Print only the count of matching lines
         \\  --header            Print column header row (for TSV/CSV with SELECT)
@@ -76,7 +78,8 @@ pub fn printUsage() void {
         \\  2  Error
         \\
         \\Examples:
-        \\  jsift --file logs.jsonl level eq error
+        \\  jsift level eq error logs.jsonl
+        \\  jsift -c level eq error logs/*.jsonl
         \\  jsift --file logs.jsonl level in error,critical,warn
         \\  jsift --file data.jsonl SELECT name,age
         \\  cat data.jsonl | jsift SELECT name,sum:balance WHERE active eq b:true
@@ -101,9 +104,17 @@ const SelectClause = struct {
     fields: []PluckField,
     /// Token index just after the SELECT clause, including the WHERE keyword if present.
     next_token: usize,
+    has_where: bool,
 };
 
-/// Parses the comma-separated fields after SELECT, up to WHERE or the end of the tokens.
+/// Whether a comma-separated list continues from token `previous` into token `next`: one
+/// ends or the other starts with a comma, as in `a,b` split as `a, b`. Anything else ends
+/// the list, so files can follow it.
+fn listContinues(previous: []const u8, next: []const u8) bool {
+    return std.mem.endsWith(u8, previous, ",") or std.mem.startsWith(u8, next, ",");
+}
+
+/// Parses the comma-separated fields after SELECT, up to WHERE or the end of the list.
 /// A field is a key, or an aggregation such as `sum:balance`.
 fn parseSelectClause(
     allocator: std.mem.Allocator,
@@ -112,8 +123,10 @@ fn parseSelectClause(
 ) !SelectClause {
     var pluck_keys: std.ArrayList(PluckField) = .empty;
     var token_index = start;
+    var has_where = false;
 
     while (token_index < tokens.len and !std.ascii.eqlIgnoreCase(tokens[token_index], "where")) : (token_index += 1) {
+        if (token_index > start and !listContinues(tokens[token_index - 1], tokens[token_index])) break;
         var fields = std.mem.splitScalar(u8, tokens[token_index], ',');
         while (fields.next()) |field| {
             // Empty items, as in `name,,age`, are skipped.
@@ -130,18 +143,28 @@ fn parseSelectClause(
 
     if (token_index < tokens.len and std.ascii.eqlIgnoreCase(tokens[token_index], "where")) {
         token_index += 1;
+        has_where = true;
+    } else {
+        // The list ended before WHERE: what follows must be files, so a WHERE further on
+        // means fields were separated by spaces instead of commas.
+        for (tokens[token_index..]) |token| {
+            if (std.ascii.eqlIgnoreCase(token, "where")) return error.SelectNeedsCommas;
+        }
     }
 
     const fields = try pluck_keys.toOwnedSlice(allocator);
     if (fields.len > max_pluck_fields) return error.TooManyPluckFields;
-    return .{ .fields = fields, .next_token = token_index };
+    return .{ .fields = fields, .next_token = token_index, .has_where = has_where };
 }
 
 /// Parses the comma-separated keys after GROUP BY, which may be spread over several tokens
-/// (`GROUP BY a,b` or `GROUP BY a, b`).
-fn parseGroupKeys(allocator: std.mem.Allocator, tokens: []const []const u8) ![]const []const u8 {
+/// (`GROUP BY a,b` or `GROUP BY a, b`). Returns the keys and the number of tokens they took.
+fn parseGroupKeys(allocator: std.mem.Allocator, tokens: []const []const u8) !struct { []const []const u8, usize } {
     var keys: std.ArrayList([]const u8) = .empty;
-    for (tokens) |token| {
+    var used: usize = 0;
+    for (tokens, 0..) |token, index| {
+        if (index > 0 and !listContinues(tokens[index - 1], token)) break;
+        used += 1;
         var items = std.mem.splitScalar(u8, token, ',');
         while (items.next()) |key| {
             if (key.len > 0) try keys.append(allocator, key);
@@ -149,7 +172,7 @@ fn parseGroupKeys(allocator: std.mem.Allocator, tokens: []const []const u8) ![]c
     }
     if (keys.items.len == 0) return error.InvalidGroupBy;
     if (keys.items.len > max_pluck_fields) return error.TooManyPluckFields;
-    return keys.toOwnedSlice(allocator);
+    return .{ try keys.toOwnedSlice(allocator), used };
 }
 
 /// Splits an aggregation prefix (`count:`, `sum:`, ...) off a SELECT field.
@@ -334,26 +357,28 @@ fn toGroups(allocator: std.mem.Allocator, expr: Expr, negated: bool) error{ OutO
 
 /// Parses the WHERE clause: conditions `[NOT] <key> <op> [<val>]` joined by AND and OR,
 /// with parentheses. AND binds tighter than OR. The result is a list of OR'ed groups whose
-/// conditions are AND'ed, which is the form the search evaluates.
-fn parseWhereClause(allocator: std.mem.Allocator, tokens: []const []const u8, start: usize) ![]ConditionGroup {
-    if (start == tokens.len) return &.{};
-    var stream: TokenStream = .{ .tokens = tokens[start..] };
+/// conditions are AND'ed, which is the form the search evaluates. Also returns the tokens
+/// left after the clause, which can only be files.
+fn parseWhereClause(allocator: std.mem.Allocator, tokens: []const []const u8) !struct { []ConditionGroup, []const []const u8 } {
+    if (tokens.len == 0) return .{ &.{}, &.{} };
+    var stream: TokenStream = .{ .tokens = tokens };
     const expr = try parseOr(allocator, &stream);
     if (stream.peek()) |token| {
-        return if (std.mem.eql(u8, token, ")")) error.UnbalancedParentheses else error.InvalidCondition;
+        if (std.mem.eql(u8, token, ")")) return error.UnbalancedParentheses;
     }
 
     const flat = try toGroups(allocator, expr, false);
     const groups = try allocator.alloc(ConditionGroup, flat.len);
     for (flat, groups) |conditions, *group| group.* = .{ .conditions = try allocator.dupe(Condition, conditions) };
-    return groups;
+    return .{ groups, tokens[stream.index..] };
 }
 
 /// Parses the arguments after the program name. `allocator` should be an arena: nothing
 /// allocated here is freed individually.
 pub fn parseArgs(allocator: std.mem.Allocator, args: []const []const u8) !Command {
     var tokens: std.ArrayList([]const u8) = .empty;
-    var config = Config{ .groups = undefined, .pluck = &[_]PluckField{} };
+    var files: std.ArrayList([]const u8) = .empty;
+    var config = Config{ .groups = &.{}, .pluck = &[_]PluckField{} };
 
     // Options may appear anywhere. Everything else is a query token, in order.
     var arg_index: usize = 0;
@@ -366,9 +391,7 @@ pub fn parseArgs(allocator: std.mem.Allocator, args: []const []const u8) !Comman
         } else if (std.mem.eql(u8, arg, "--file")) {
             arg_index += 1;
             if (arg_index == args.len) return error.MissingFileValue;
-            // Only one input is read. A second --file would silently replace the first.
-            if (config.file_path != null) return error.DuplicateFile;
-            config.file_path = args[arg_index];
+            try files.append(allocator, args[arg_index]);
         } else if (std.mem.eql(u8, arg, "--limit")) {
             arg_index += 1;
             if (arg_index == args.len) return error.MissingLimitValue;
@@ -400,13 +423,17 @@ pub fn parseArgs(allocator: std.mem.Allocator, args: []const []const u8) !Comman
         }
     }
 
-    // GROUP BY, if present, comes last. Everything after it is the group keys.
+    // The layout is [SELECT <fields> [WHERE]] [<conditions>] [GROUP BY <keys>] [<files>].
+    // Files are the tokens left over at the end.
     var query_tokens = tokens.items;
+    var group_files: ?[]const []const u8 = null;
     for (query_tokens, 0..) |token, index| {
         if (index + 1 < query_tokens.len and std.ascii.eqlIgnoreCase(token, "group") and
             std.ascii.eqlIgnoreCase(query_tokens[index + 1], "by"))
         {
-            config.group_by = try parseGroupKeys(allocator, query_tokens[index + 2 ..]);
+            const keys, const used = try parseGroupKeys(allocator, query_tokens[index + 2 ..]);
+            config.group_by = keys;
+            group_files = query_tokens[index + 2 + used ..];
             query_tokens = query_tokens[0..index];
             break;
         }
@@ -414,6 +441,7 @@ pub fn parseArgs(allocator: std.mem.Allocator, args: []const []const u8) !Comman
 
     // SELECT, if present, comes first among the query tokens.
     var next_token: usize = 0;
+    var has_where = true;
     if (next_token < query_tokens.len and isKeyword(
         query_tokens[next_token],
         if (next_token + 1 < query_tokens.len) query_tokens[next_token + 1] else null,
@@ -423,10 +451,20 @@ pub fn parseArgs(allocator: std.mem.Allocator, args: []const []const u8) !Comman
         const select = try parseSelectClause(allocator, query_tokens, next_token);
         config.pluck = select.fields;
         next_token = select.next_token;
+        has_where = select.has_where;
     }
     if (config.group_by.len > 0 and config.pluck.len == 0) return error.GroupWithoutSelect;
 
-    config.groups = try parseWhereClause(allocator, query_tokens, next_token);
+    // Without WHERE, a SELECT has no conditions and anything after its fields is a file.
+    var rest: []const []const u8 = query_tokens[next_token..];
+    if (has_where) config.groups, rest = try parseWhereClause(allocator, rest);
+    if (group_files) |after_group| {
+        // Files go after GROUP BY, so nothing may be left before it.
+        if (rest.len > 0) return error.InvalidCondition;
+        rest = after_group;
+    }
+    try files.appendSlice(allocator, rest);
+    config.files = try files.toOwnedSlice(allocator);
 
     if (config.groups.len == 0 and config.pluck.len == 0 and !config.count_only) {
         return error.MissingArguments;
@@ -447,7 +485,22 @@ test "parseArgs flags and errors" {
     try std.testing.expectError(error.MissingArguments, parseArgs(allocator, &.{}));
     try std.testing.expectEqual(Command.help, try parseArgs(allocator, &.{ "a", "--help" }));
     try std.testing.expectEqual(Command.version, try parseArgs(allocator, &.{ "-V", "a", "exists" }));
-    try std.testing.expectError(error.DuplicateFile, parseArgs(allocator, &.{ "--file", "a", "--file", "b", "a", "exists" }));
+    // Files: repeated --file, and the terms left after the query, in that order.
+    const two_files = (try parseArgs(allocator, &.{ "--file", "x", "--file", "y", "a", "exists", "z" })).run;
+    try std.testing.expectEqual(@as(usize, 3), two_files.files.len);
+    try std.testing.expectEqualStrings("z", two_files.files[2]);
+    const select_files = (try parseArgs(allocator, &.{ "SELECT", "a,", "b", "x.jsonl", "y.jsonl" })).run;
+    try std.testing.expectEqual(@as(usize, 2), select_files.pluck.len);
+    try std.testing.expectEqual(@as(usize, 2), select_files.files.len);
+    const where_files = (try parseArgs(allocator, &.{ "SELECT", "a", "WHERE", "b", "eq", "1", "x.jsonl" })).run;
+    try std.testing.expectEqualStrings("x.jsonl", where_files.files[0]);
+    const group_files = (try parseArgs(allocator, &.{ "SELECT", "a,count:b", "WHERE", "b", "exists", "GROUP", "BY", "a", ",c", "x.jsonl" })).run;
+    try std.testing.expectEqual(@as(usize, 2), group_files.group_by.len);
+    try std.testing.expectEqualStrings("x.jsonl", group_files.files[0]);
+    // Fields separated by spaces would leave a WHERE among the files.
+    try std.testing.expectError(error.SelectNeedsCommas, parseArgs(allocator, &.{ "SELECT", "a", "b", "WHERE", "a", "exists" }));
+    // Files must come after GROUP BY.
+    try std.testing.expectError(error.InvalidCondition, parseArgs(allocator, &.{ "SELECT", "count:a", "WHERE", "a", "exists", "x.jsonl", "GROUP", "BY", "a" }));
     try std.testing.expectError(error.InvertOption, parseArgs(allocator, &.{ "-v", "a", "exists" }));
 
     // `--` lets query terms start with dashes; negative numbers never needed it.
@@ -529,7 +582,8 @@ test "parentheses" {
     try std.testing.expectError(error.UnbalancedParentheses, parseArgs(a, &.{ "(a", "exists" }));
     try std.testing.expectError(error.UnbalancedParentheses, parseArgs(a, &.{ "a", "exists", ")" }));
     try std.testing.expectError(error.InvalidCondition, parseArgs(a, &.{ "(", ")" }));
-    try std.testing.expectError(error.InvalidCondition, parseArgs(a, &.{ "a", "exists", "b", "exists" }));
+    // Terms after a complete query are files.
+    try std.testing.expectEqual(@as(usize, 2), (try parseArgs(a, &.{ "(a", "exists)", "b", "exists" })).run.files.len);
 
     // 11 factors of two alternatives expand to 2048 groups, over the limit.
     var many: std.ArrayList([]const u8) = .empty;

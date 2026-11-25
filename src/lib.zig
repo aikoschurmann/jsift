@@ -74,7 +74,8 @@ fn query(
         .help, .version => return error.UnsupportedOption,
         .run => |config| config,
     };
-    if (config.file_path != null) return error.UnsupportedOption;
+    // The input comes from the caller, so leftover terms aren't files here.
+    if (config.files.len > 0) return error.TrailingTerms;
 
     var out: std.Io.Writer.Allocating = .init(gpa);
     defer out.deinit();
@@ -84,8 +85,9 @@ fn query(
         // The scanner still runs its reader on its own OS thread.
         var threaded: std.Io.Threaded = .init_single_threaded;
         const io = threaded.io();
-        config.file_path = std.mem.span(path_z);
-        result.matched = try Scanner.searchFile(arena, config, &out.writer, io);
+        config.files = &.{std.mem.span(path_z)};
+        var failed_path: ?[]const u8 = null;
+        result.matched = try Scanner.searchFiles(arena, config, &out.writer, io, &failed_path);
     } else {
         result.matched = try Scanner.searchBytes(arena, input, config, &out.writer);
     }
@@ -97,7 +99,8 @@ fn query(
 
 fn errorMessage(err: anyerror, file_path: ?[*:0]const u8) []const u8 {
     return switch (err) {
-        error.MissingFileValue, error.DuplicateFile => "--file is not supported here",
+        error.MissingFileValue => "--file is not supported here",
+        error.TrailingTerms => "unexpected terms after the query (a missing AND or OR?); pass the input as file= or data=",
         error.MissingLimitValue => "--limit needs a number",
         error.InvalidLimit => "--limit must be a non-negative integer",
         error.MissingFormatValue => "--format needs json, csv or tsv",
@@ -114,6 +117,7 @@ fn errorMessage(err: anyerror, file_path: ?[*:0]const u8) []const u8 {
         error.MissingArguments => "no query given, expected a condition or SELECT",
         error.TooManyPluckFields => "too many SELECT fields (max 256)",
         error.InvalidSelectField => "aggregation needs a field, e.g. sum:balance",
+        error.SelectNeedsCommas => "separate SELECT fields with commas, e.g. SELECT name,age WHERE ...",
         error.UnsupportedOption => "--file, --help and --version are not supported here",
         error.NonNumericComparison => "gt, lt, gte and lte need a numeric value",
         error.InvalidKey => "keys can't be empty or have empty path segments",

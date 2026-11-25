@@ -39,6 +39,9 @@ pub const Config = struct {
     fast: bool = false,
     /// Rule lines out with the byte-level search before parsing. Only turned off by tests.
     prefilter: bool = true,
+    /// Worker threads for the scan. Null picks one per CPU, up to a cap; 1 is the
+    /// single-threaded scan.
+    threads: ?usize = null,
     /// Bytes per block read from a regular file. Not an option: tests shrink it so that
     /// small inputs span many blocks.
     block_size: usize = default_block_size,

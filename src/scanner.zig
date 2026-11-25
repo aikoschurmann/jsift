@@ -1,4 +1,5 @@
-//! Runs a query over a file or stdin: a reader thread fills blocks while the search scans them.
+//! Runs a query over files, stdin or bytes in memory. A reader thread fills blocks while the
+//! search scans them, on one thread or, for large inputs, on several (`runParallel`).
 const std = @import("std");
 const builtin = @import("builtin");
 const cli = @import("cli.zig");
@@ -16,6 +17,9 @@ const Search = struct {
     /// Per anchor: whether it passed at the key occurrence being evaluated.
     passed: []bool,
     scratch: values.Scratch,
+    /// Allocates the groups in `group_map`. In the parallel scan it is the chunk's arena,
+    /// since every chunk collects its own groups.
+    group_alloc: std.mem.Allocator,
     /// The exact layer. After a successful `exactLineMatches`, its slots hold the line's values.
     parser: *json.Parser,
     match_count: usize = 0,
@@ -45,7 +49,7 @@ const Search = struct {
     /// decoded, so `"a"` and `"\u0061"` share a group but `"1"` and `1` don't.
     fn groupStates(self: *Search, line: []const u8) ![]output.AggState {
         const plan = self.plan;
-        const gpa = self.scratch.gpa;
+        const gpa = self.group_alloc;
         var key_values: [cli.max_pluck_fields]?values.Value = undefined;
         self.group_key.clearRetainingCapacity();
 
@@ -55,7 +59,7 @@ const Search = struct {
             else
                 values.extractField(line, &key.finder);
             const value = key_value.* orelse {
-                try self.group_key.append(gpa, 0);
+                try self.group_key.append(self.scratch.gpa, 0);
                 continue;
             };
             const escaped = value.is_string and std.mem.findScalar(u8, value.raw, '\\') != null;
@@ -63,9 +67,9 @@ const Search = struct {
                 try values.stringText(.{ .raw = value.raw, .escaped = escaped }, &self.scratch)
             else
                 value.raw;
-            try self.group_key.append(gpa, if (value.is_string) 1 else 2);
-            try self.group_key.appendSlice(gpa, std.mem.asBytes(&text.len));
-            try self.group_key.appendSlice(gpa, text);
+            try self.group_key.append(self.scratch.gpa, if (value.is_string) 1 else 2);
+            try self.group_key.appendSlice(self.scratch.gpa, std.mem.asBytes(&text.len));
+            try self.group_key.appendSlice(self.scratch.gpa, text);
         }
 
         const entry = try self.group_map.getOrPut(gpa, self.group_key.items);
@@ -284,15 +288,10 @@ const Search = struct {
     }
 };
 
-const Buffer = struct { data: []u8, len: usize = 0, eof: bool = false };
+const page_allocator = std.heap.page_allocator;
 
-/// State shared by the reader thread and the consumer. The two sides hand the buffers
-/// back and forth with two semaphores:
-///   - `read_sem` counts buffers the reader may fill. It starts at 2, so both are free.
-///   - `fill_sem` counts filled buffers the consumer may scan.
-/// Both sides walk `bufs[0]` and `bufs[1]` in the same order, so neither side has to
-/// send the buffer index to the other.
-const ReaderCtx = struct {
+/// Where blocks are read from, and how.
+const ReadTarget = struct {
     file: std.Io.File,
     io: std.Io,
     /// Input is a pipe or terminal: hand data over as soon as nothing more is immediately
@@ -301,14 +300,17 @@ const ReaderCtx = struct {
     /// Bytes per block: `Config.block_size`, or `Config.stream_block_size` when streaming.
     block_size: usize,
 
-    bufs: [2]Buffer,
-
-    /// Set by `abandonReader` to make the reader exit at its next check.
-    stop: std.atomic.Value(bool) = .init(false),
-    read_err: ?anyerror = null,
-
-    fill_sem: std.Io.Semaphore = .{ .permits = 0 },
-    read_sem: std.Io.Semaphore = .{ .permits = 2 },
+    /// Regular files are read in full blocks. Pipes, terminals and sockets are streamed.
+    /// If stat fails, assume streaming, which is the safe choice for an unknown source.
+    fn init(file: std.Io.File, block_size: usize, stream_block_size: usize, io: std.Io) ReadTarget {
+        const streaming = if (file.stat(io)) |stat| stat.kind != .file else |_| true;
+        return .{
+            .file = file,
+            .io = io,
+            .streaming = streaming,
+            .block_size = if (streaming) stream_block_size else block_size,
+        };
+    }
 };
 
 /// True when a read on `file` would return without blocking. Always false on Windows, where
@@ -321,88 +323,119 @@ fn dataReady(file: std.Io.File) bool {
 
 /// Reads into `buf` until it is full, or for streaming input until a small block is
 /// gathered or nothing more is immediately readable (so `tail -f` matches show up right
-/// away). Always reads at least once. Returns true at end of input or on a read error.
-fn fillBuffer(ctx: *ReaderCtx, buf: *Buffer, total: *usize) bool {
-    while (total.* < buf.data.len) {
-        const read_len = ctx.file.readStreaming(ctx.io, &.{buf.data[total.*..]}) catch |err| {
+/// away). Always reads at least once. Returns true at end of input or on a read error,
+/// which is stored in `read_err`.
+fn fillBuffer(target: ReadTarget, buf: []u8, total: *usize, read_err: *?anyerror) bool {
+    while (total.* < buf.len) {
+        const read_len = target.file.readStreaming(target.io, &.{buf[total.*..]}) catch |err| {
             // End of stream is a normal end of input, so only other errors are recorded.
-            if (err != error.EndOfStream) ctx.read_err = err;
+            if (err != error.EndOfStream) read_err.* = err;
             return true;
         };
         if (read_len == 0) return true;
 
         total.* += read_len;
         // Streaming input: stop once a small block is full or the pipe has no more data right now.
-        const block_full = total.* >= ctx.block_size;
-        if (ctx.streaming and (block_full or !dataReady(ctx.file))) return false;
+        const block_full = total.* >= target.block_size;
+        if (target.streaming and (block_full or !dataReady(target.file))) return false;
     }
     return false;
 }
 
-fn growBuffer(buf: *Buffer, new_len: usize) !void {
-    buf.data = try std.heap.page_allocator.realloc(buf.data, new_len);
+fn growBuffer(buf: *[]u8, new_len: usize) !void {
+    buf.* = try page_allocator.realloc(buf.*, new_len);
 }
 
+/// One block of input as read by `readBlock`.
+const Block = struct {
+    /// Bytes at the start of the buffer that form whole lines (or the rest of the input).
+    len: usize,
+    /// The input ended with this block, normally or because of `read_err`.
+    eof: bool,
+    read_err: ?anyerror = null,
+};
+
+/// Fills `buf` with `carry` followed by fresh input, up to the last complete line, growing
+/// `buf` when it is too small (an empty `buf` is allocated here). On return, `carry` is the
+/// partial last line. It sits in `buf` past the block's `len`, which no scan reads, so it
+/// stays valid until the next call copies it into the next buffer. That buffer must be a
+/// different one: `buf` is the only one this call resizes.
+fn readBlock(target: ReadTarget, buf: *[]u8, carry: *[]const u8) Block {
+    // Make room for the carry plus at least half a block of fresh data. Growing
+    // only when this fails keeps the common path free of reallocations.
+    if (carry.len + target.block_size / 2 > buf.len or buf.len == 0) {
+        // A failure ends the input like a read error, so the scan stops instead of waiting
+        // for a block that will never come.
+        growBuffer(buf, carry.len + @max(target.block_size, 1)) catch |err| return .{ .len = 0, .eof = true, .read_err = err };
+    }
+    @memcpy(buf.*[0..carry.len], carry.*);
+    var total = carry.len;
+    // The carried bytes contain no newline, so the newline search can start after them.
+    var scanned = carry.len;
+    carry.* = &.{};
+
+    while (true) {
+        var read_err: ?anyerror = null;
+        if (fillBuffer(target, buf.*, &total, &read_err)) {
+            // End of input: the whole buffer, including a last line without a newline, is
+            // the final block. Nothing is carried over.
+            return .{ .len = total, .eof = true, .read_err = read_err };
+        }
+        if (finder.lastNewline(buf.*, scanned, total)) |newline| {
+            // Hand over everything up to the last newline. The rest is carried over.
+            carry.* = buf.*[newline + 1 .. total];
+            return .{ .len = newline + 1, .eof = false };
+        }
+        // No complete line yet: keep reading, growing the buffer if a line outgrew it.
+        scanned = total;
+        if (total == buf.len) {
+            growBuffer(buf, buf.len * 2) catch |err| return .{ .len = total, .eof = true, .read_err = err };
+        }
+    }
+}
+
+const Buffer = struct { data: []u8 = &.{}, len: usize = 0, eof: bool = false };
+
+/// State shared by the reader thread and the consumer of the single-threaded scan. The two
+/// sides hand the buffers back and forth with two semaphores:
+///   - `read_sem` counts buffers the reader may fill. It starts at 2, so both are free.
+///   - `fill_sem` counts filled buffers the consumer may scan.
+/// Both sides walk `bufs[0]` and `bufs[1]` in the same order, so neither side has to
+/// send the buffer index to the other.
+const ReaderCtx = struct {
+    target: ReadTarget,
+    bufs: [2]Buffer = .{ .{}, .{} },
+
+    /// Set by `stopReader` to make the reader exit at its next check.
+    stop: std.atomic.Value(bool) = .init(false),
+    read_err: ?anyerror = null,
+
+    fill_sem: std.Io.Semaphore = .{ .permits = 0 },
+    read_sem: std.Io.Semaphore = .{ .permits = 2 },
+
+    fn destroy(ctx: *ReaderCtx) void {
+        for (ctx.bufs) |buf| page_allocator.free(buf.data);
+        page_allocator.destroy(ctx);
+    }
+};
+
 fn readerThread(ctx: *ReaderCtx) void {
-    const io = ctx.io;
+    const io = ctx.target.io;
     var buf_index: usize = 0;
-    // Partial last line of the previously filled buffer. It sits past that buffer's `len`,
-    // which the consumer never reads, so it can be copied straight into the next buffer.
-    // The other buffer is never resized in this round, so this slice stays valid until copied.
+    // Partial last line of the previously filled buffer (see `readBlock`).
     var carry: []const u8 = &.{};
 
     while (true) {
-        // Wait until the consumer has released a buffer. Bail out if abandoned.
+        // Wait until the consumer has released a buffer. Bail out if stopped.
         ctx.read_sem.wait(io) catch return;
         if (ctx.stop.load(.acquire)) return;
         const buf = &ctx.bufs[buf_index];
-
-        // Make room for the carry plus at least half a block of fresh data. Growing
-        // only when this fails keeps the common path free of reallocations.
-        if (carry.len + ctx.block_size / 2 > buf.data.len) {
-            growBuffer(buf, carry.len + ctx.block_size) catch |err| {
-                // Report the failure through the same path as end of input so the consumer
-                // exits instead of waiting for a buffer that will never come.
-                ctx.read_err = err;
-                buf.len = 0;
-                buf.eof = true;
-                ctx.fill_sem.post(io);
-                return;
-            };
-        }
-        @memcpy(buf.data[0..carry.len], carry);
-        var total = carry.len;
-        // The carried bytes contain no newline, so the newline search can start after them.
-        var scanned = carry.len;
-
-        while (true) {
-            if (fillBuffer(ctx, buf, &total)) {
-                // End of input: the whole buffer, including a last line without a newline, is
-                // the final block. Nothing is carried over.
-                buf.len = total;
-                buf.eof = true;
-                ctx.fill_sem.post(io);
-                return;
-            }
-            if (finder.lastNewline(buf.data, scanned, total)) |newline| {
-                // Hand over everything up to the last newline. The rest is carried over.
-                buf.len = newline + 1;
-                carry = buf.data[newline + 1 .. total];
-                break;
-            }
-            // No complete line yet: keep reading, growing the buffer if a line outgrew it.
-            scanned = total;
-            if (total == buf.data.len) {
-                growBuffer(buf, buf.data.len * 2) catch |err| {
-                    ctx.read_err = err;
-                    buf.len = total;
-                    buf.eof = true;
-                    ctx.fill_sem.post(io);
-                    return;
-                };
-            }
-        }
+        const block = readBlock(ctx.target, &buf.data, &carry);
+        buf.len = block.len;
+        buf.eof = block.eof;
+        if (block.read_err) |err| ctx.read_err = err;
         ctx.fill_sem.post(io);
+        if (block.eof) return;
         buf_index = 1 - buf_index;
     }
 }
@@ -427,56 +460,572 @@ fn consume(search: *Search, ctx: *ReaderCtx, io: std.Io) !bool {
     }
 }
 
-/// Returns true when all input was consumed, false when the match limit stopped it early.
+/// The single-threaded scan of one file: a reader thread fills two buffers in turn while
+/// this thread scans them. Returns true when all input was consumed, false when the match
+/// limit stopped it early.
 fn runSearch(search: *Search, file: std.Io.File, config: cli.Config, io: std.Io) !bool {
     // When we stop early the reader may be blocked in a read that never returns (e.g. on
-    // `tail -f`), so it is detached rather than joined. Its context and buffers must then
-    // outlive this function, so they come from page_allocator and are freed only after a join.
-    const page_allocator = std.heap.page_allocator;
+    // `tail -f`), so it is then detached rather than joined. Its context and buffers must
+    // outlive this function, so they come from page_allocator.
     const ctx = try page_allocator.create(ReaderCtx);
-    // Regular files are read in full blocks. Pipes, terminals and sockets are streamed.
-    // If stat fails, assume streaming, which is the safe choice for an unknown source.
-    const streaming = if (file.stat(io)) |stat| stat.kind != .file else |_| true;
-
-    const block_size = if (streaming) config.stream_block_size else config.block_size;
-
-    const first_data = try page_allocator.alloc(u8, block_size);
-    errdefer page_allocator.free(first_data);
-    const second_data = try page_allocator.alloc(u8, block_size);
-
-    ctx.* = .{
-        .file = file,
-        .io = io,
-        .streaming = streaming,
-        .block_size = block_size,
-        .bufs = .{ .{ .data = first_data }, .{ .data = second_data } },
+    ctx.* = .{ .target = .init(file, config.block_size, config.stream_block_size, io) };
+    const thread = std.Thread.spawn(.{}, readerThread, .{ctx}) catch |err| {
+        ctx.destroy();
+        return err;
     };
-    const thread = try std.Thread.spawn(.{}, readerThread, .{ctx});
 
-    // Consume on this thread. An early stop abandons the reader instead of joining it.
+    // Consume on this thread. An early stop stops the reader instead of waiting for the end.
     const finished = consume(search, ctx, io) catch |err| {
-        abandonReader(ctx, thread, io);
+        stopReader(ctx, thread);
         return err;
     };
     if (!finished) {
-        abandonReader(ctx, thread, io);
+        stopReader(ctx, thread);
         return false;
     }
 
     thread.join();
-    page_allocator.free(ctx.bufs[0].data);
-    page_allocator.free(ctx.bufs[1].data);
-    page_allocator.destroy(ctx);
+    ctx.destroy();
     return true;
 }
 
-/// Stops the reader without waiting for it. Setting `stop` and posting `read_sem` wakes a
-/// reader that is waiting for a free buffer. A reader blocked inside a read is not woken and
-/// keeps running until its read returns. Its memory is intentionally not freed.
-fn abandonReader(ctx: *ReaderCtx, thread: std.Thread, io: std.Io) void {
+/// Stops the reader early. Setting `stop` and posting `read_sem` wakes a reader that is
+/// waiting for a free buffer. A read from a regular file always returns, so that reader is
+/// joined. A reader blocked on a pipe is not woken: it is detached, and keeps running until
+/// its read returns. Its memory is then intentionally not freed.
+fn stopReader(ctx: *ReaderCtx, thread: std.Thread) void {
     ctx.stop.store(true, .release);
-    ctx.read_sem.post(io);
-    thread.detach();
+    ctx.read_sem.post(ctx.target.io);
+    if (ctx.target.streaming) {
+        thread.detach();
+    } else {
+        thread.join();
+        ctx.destroy();
+    }
+}
+
+// The parallel scan. A feeder thread cuts the input into newline-aligned chunks, workers
+// scan chunks into per-chunk results, and the calling thread writes the results out in
+// input order. Chunk `n` goes through slot `n % slot count`: the feeder fills the slot's
+// `Chunk`, a worker fills the slot's `ChunkResult`, and the calling thread hands the slot
+// back to the feeder once it has written it out. Two slots per thread keep every worker busy
+// while the chunk at the head of the line is still being scanned.
+//
+// The calling thread scans the head chunk itself whenever no worker has taken it yet, and
+// workers only take chunks past the head. Input that arrives no faster than one thread can
+// scan it (a pipe, usually) then goes through one handoff per chunk, as in the
+// single-threaded scan, and the workers sleep. Only when the feeder gets ahead do workers
+// pick up the chunks past the head. While a worker still has the head, the calling thread
+// scans the next untaken chunk like a worker, so it is never idle while there is work.
+
+/// Chunks of a regular file in the parallel scan. Smaller than a single-threaded block:
+/// the feeder's copy of each chunk is then still in the shared cache when a worker scans it,
+/// and the last chunks to finish hold up the end less. Measured fastest on an Apple M2 Pro
+/// for both cheap and parse-bound queries.
+const parallel_block_size = 512 * 1024;
+
+/// Chunks that must be waiting past the head before a worker is woken or started for
+/// them. A single one is usually scanned by the calling thread as soon as it is done with
+/// the head, sooner than a worker would wake up, so waking a worker for it costs more than
+/// it saves. This keeps input that one thread nearly keeps up with, such as a pipe, on the
+/// cheaper single-thread path.
+const min_backlog = 2;
+
+/// Input for the parallel scan.
+const FeedSource = union(enum) {
+    bytes: []const u8,
+    file: std.Io.File,
+    /// Opened and read in order by the feeder. Copied into `Feed.arena`.
+    files: []const []const u8,
+};
+
+/// The feeder's half of a slot: one chunk of input.
+const Chunk = struct {
+    /// Buffer the feeder reads into. Kept across uses of the slot, and grown as needed.
+    buf: []u8 = &.{},
+    /// The newline-aligned bytes to scan: a prefix of `buf`, or a slice of in-memory input.
+    input: []const u8 = &.{},
+    /// Lines in the same file before `input`, for --line-number.
+    first_line: usize = 0,
+    /// Nothing follows this chunk.
+    last: bool = false,
+    /// An error that ended the input after this chunk, and the index of the file it
+    /// happened in, among `FeedSource.files`.
+    read_err: ?anyerror = null,
+    file_index: ?usize = null,
+};
+
+/// Which chunks are filled and who scans them. Guarded by `mutex`, as is `ChunkResult.done`.
+const Queue = struct {
+    mutex: std.Io.Mutex = .init,
+    /// Idle workers wait here for a chunk past the head.
+    work: std.Io.Condition = .init,
+    /// The calling thread waits here for a chunk to be filled or the head to be scanned.
+    progress: std.Io.Condition = .init,
+    /// Chunks filled so far.
+    filled: usize = 0,
+    /// The first chunk nobody has taken. Chunks are taken in order.
+    next: usize = 0,
+    /// The chunk the calling thread is on: written out up to here.
+    head: usize = 0,
+    /// Workers waiting on `work` that no signal is on its way to yet.
+    idle: usize = 0,
+    /// Workers started. Workers are started by the feeder when a chunk is ready for a worker
+    /// and none is idle, so a small input or a slow stream only starts the workers it needs.
+    spawned: usize = 0,
+};
+
+/// The parts of the parallel scan the feeder uses. When the scan stops early, the feeder
+/// may be blocked in a read that never returns (`tail -f`), so it is detached rather than
+/// joined. This is therefore reference-counted: the feeder and the calling thread each hold
+/// a reference, and whoever drops the last one frees it.
+const Feed = struct {
+    io: std.Io,
+    source: FeedSource,
+    block_size: usize,
+    stream_block_size: usize,
+    /// Count each chunk's newlines, for --line-number.
+    count_lines: bool,
+    chunks: []Chunk,
+    /// Slots the feeder may fill. Starts at the slot count. The calling thread posts it when
+    /// it has written a slot out.
+    free: std.Io.Semaphore,
+    queue: Queue = .{},
+    /// Set, under `queue.mutex`, once the calling thread needs no more chunks. The feeder
+    /// also reads it outside the lock, after waiting for a slot.
+    stop: std.atomic.Value(bool) = .init(false),
+    refs: std.atomic.Value(u32) = .init(2),
+    /// Holds the copy of the file paths: a detached feeder may outlive the caller's list.
+    arena: std.heap.ArenaAllocator = .init(page_allocator),
+    /// Owned by the calling thread. The feeder only starts them, under `queue.mutex` and
+    /// before `stop`, so the calling thread knows which ones to join.
+    workers: []Worker,
+    /// Owned by the calling thread. Workers set `done` under `queue.mutex`.
+    results: []ChunkResult,
+
+    fn create(source: FeedSource, config: cli.Config, workers: []Worker, results: []ChunkResult, io: std.Io) !*Feed {
+        const slot_count = results.len;
+        const feed = try page_allocator.create(Feed);
+        errdefer page_allocator.destroy(feed);
+        const chunks = try page_allocator.alloc(Chunk, slot_count);
+        errdefer page_allocator.free(chunks);
+        @memset(chunks, .{});
+        feed.* = .{
+            .io = io,
+            .source = source,
+            .block_size = @min(config.block_size, parallel_block_size),
+            .stream_block_size = config.stream_block_size,
+            .count_lines = false,
+            .chunks = chunks,
+            .free = .{ .permits = slot_count },
+            .workers = workers,
+            .results = results,
+        };
+        errdefer feed.arena.deinit();
+        if (source == .files) {
+            const paths = try feed.arena.allocator().alloc([]const u8, source.files.len);
+            for (source.files, paths) |path, *copy| copy.* = try feed.arena.allocator().dupe(u8, path);
+            feed.source = .{ .files = paths };
+        }
+        return feed;
+    }
+
+    /// Drops one reference, and frees everything when it was the last.
+    fn release(feed: *Feed) void {
+        if (feed.refs.fetchSub(1, .acq_rel) != 1) return;
+        for (feed.chunks) |chunk| page_allocator.free(chunk.buf);
+        page_allocator.free(feed.chunks);
+        feed.arena.deinit();
+        page_allocator.destroy(feed);
+    }
+
+    /// Feeder: waits until the slot for chunk `seq` is free. Null once the scan is stopped.
+    fn acquire(feed: *Feed, seq: usize) ?*Chunk {
+        feed.free.waitUncancelable(feed.io);
+        if (feed.stop.load(.acquire)) return null;
+        return &feed.chunks[seq % feed.chunks.len];
+    }
+
+    /// Feeder: hands chunk `seq.*` over and moves on to the next.
+    fn publish(feed: *Feed, seq: *usize) void {
+        const io = feed.io;
+        const queue = &feed.queue;
+        queue.mutex.lockUncancelable(io);
+        defer queue.mutex.unlock(io);
+        queue.filled += 1;
+        // Neither signal makes a system call when nobody waits.
+        queue.progress.signal(io);
+        // Chunks past the head that nobody has taken yet.
+        const waiting = queue.filled - @max(queue.next, queue.head + 1);
+        if (queue.filled > queue.head + 1 and waiting >= min_backlog) {
+            // A chunk for a worker.
+            if (queue.idle > 0) {
+                queue.idle -= 1;
+                queue.work.signal(io);
+            } else if (queue.spawned < feed.workers.len and !feed.stop.load(.monotonic)) {
+                // A failure is ignored: the threads already running finish the scan.
+                const worker = &feed.workers[queue.spawned];
+                if (std.Thread.spawn(.{}, workerMain, .{worker})) |thread| {
+                    worker.thread = thread;
+                    queue.spawned += 1;
+                } else |_| {}
+            }
+        }
+        seq.* += 1;
+    }
+
+    /// Worker: takes the next chunk past the head, waiting for one. Null once stopped.
+    fn take(feed: *Feed) ?usize {
+        const io = feed.io;
+        const queue = &feed.queue;
+        queue.mutex.lockUncancelable(io);
+        defer queue.mutex.unlock(io);
+        while (true) {
+            if (feed.stop.load(.monotonic)) return null;
+            if (queue.next < queue.filled and queue.next > queue.head) return feed.takeNext();
+            // `publish` decrements `idle` when it signals, so a worker is never counted twice.
+            queue.idle += 1;
+            queue.work.waitUncancelable(io, &queue.mutex);
+        }
+    }
+
+    /// Takes chunk `queue.next`, which must be filled. Locked.
+    fn takeNext(feed: *Feed) usize {
+        const seq = feed.queue.next;
+        feed.queue.next += 1;
+        feed.results[seq % feed.results.len].done = false;
+        return seq;
+    }
+
+    /// Worker or helping calling thread: marks chunk `seq`'s result as ready.
+    fn finish(feed: *Feed, seq: usize) void {
+        const io = feed.io;
+        const queue = &feed.queue;
+        queue.mutex.lockUncancelable(io);
+        defer queue.mutex.unlock(io);
+        feed.results[seq % feed.results.len].done = true;
+        if (seq == queue.head) queue.progress.signal(io);
+    }
+
+    /// What the calling thread does next while it is on chunk `head`.
+    const Step = union(enum) {
+        /// Nobody took the head: scan it straight into the output.
+        scan_head,
+        /// A worker scanned the head: write its result.
+        write_head,
+        /// A worker still has the head: meanwhile, scan this later chunk like a worker.
+        help: usize,
+    };
+
+    /// Calling thread: moves the head to chunk `head` and waits until there is something to do.
+    fn nextStep(feed: *Feed, head: usize) Step {
+        const io = feed.io;
+        const queue = &feed.queue;
+        queue.mutex.lockUncancelable(io);
+        defer queue.mutex.unlock(io);
+        queue.head = head;
+        while (true) {
+            // No worker takes the head, so it stays untaken while this thread waits. The
+            // feeder fills one more chunk until the input ends, so the wait ends.
+            if (queue.next == head) {
+                if (queue.filled > head) {
+                    _ = feed.takeNext();
+                    return .scan_head;
+                }
+            } else if (feed.results[head % feed.results.len].done) {
+                return .write_head;
+            } else if (queue.next < queue.filled) {
+                return .{ .help = feed.takeNext() };
+            }
+            queue.progress.waitUncancelable(io, &queue.mutex);
+        }
+    }
+};
+
+fn feederThread(feed: *Feed) void {
+    defer feed.release();
+    var seq: usize = 0;
+    switch (feed.source) {
+        .bytes => |data| feedBytes(feed, data, &seq),
+        .file => |file| _ = feedFile(feed, file, null, true, &seq),
+        .files => |paths| for (paths, 0..) |path, index| {
+            const file = std.Io.Dir.cwd().openFile(feed.io, path, .{}) catch |err| {
+                // The error ends the input. It is reported once the earlier files are written out.
+                const chunk = feed.acquire(seq) orelse return;
+                chunk.* = .{ .buf = chunk.buf, .last = true, .read_err = err, .file_index = index };
+                feed.publish(&seq);
+                return;
+            };
+            defer file.close(feed.io);
+            if (!feedFile(feed, file, index, index + 1 == paths.len, &seq)) return;
+        },
+    }
+}
+
+/// Cuts in-memory input into chunks of about `block_size` bytes, each ending at a newline.
+fn feedBytes(feed: *Feed, data: []const u8, seq: *usize) void {
+    var start: usize = 0;
+    var lines: usize = 0;
+    while (true) {
+        const chunk = feed.acquire(seq.*) orelse return;
+        var end = @min(start + @max(feed.block_size, 1), data.len);
+        // Extend the chunk to the end of the line its last byte is in.
+        if (end < data.len) end = if (std.mem.findScalarPos(u8, data, end - 1, '\n')) |newline| newline + 1 else data.len;
+        const last = end == data.len;
+        chunk.* = .{ .buf = chunk.buf, .input = data[start..end], .first_line = lines, .last = last };
+        if (feed.count_lines) lines += std.mem.countScalar(u8, chunk.input, '\n');
+        feed.publish(seq);
+        if (last) return;
+        start = end;
+    }
+}
+
+/// Reads one file in chunks. Returns true when the file ended and more input follows, false
+/// when the input ended or the scan was stopped.
+fn feedFile(feed: *Feed, file: std.Io.File, file_index: ?usize, last_file: bool, seq: *usize) bool {
+    const target: ReadTarget = .init(file, feed.block_size, feed.stream_block_size, feed.io);
+    // Partial last line of the previous chunk (see `readBlock`). There are two slots at
+    // least, so the previous chunk's buffer is never the one being filled.
+    var carry: []const u8 = &.{};
+    // Line numbers restart in every file, as in grep.
+    var lines: usize = 0;
+    while (true) {
+        const chunk = feed.acquire(seq.*) orelse return false;
+        const block = readBlock(target, &chunk.buf, &carry);
+        const last = block.eof and (last_file or block.read_err != null);
+        chunk.input = chunk.buf[0..block.len];
+        chunk.first_line = lines;
+        chunk.last = last;
+        chunk.read_err = block.read_err;
+        chunk.file_index = file_index;
+        if (feed.count_lines) lines += std.mem.countScalar(u8, chunk.input, '\n');
+        feed.publish(seq);
+        if (block.eof) return !last;
+    }
+}
+
+/// A worker's half of a slot: what scanning its chunk produced.
+const ChunkResult = struct {
+    /// The rows the chunk printed.
+    out: std.Io.Writer.Allocating,
+    match_count: usize = 0,
+    /// The chunk's own aggregates, merged into the totals in input order.
+    agg_states: []output.AggState,
+    /// GROUP BY: the chunk's own groups, in first-seen order, allocated in `arena`.
+    group_map: std.StringArrayHashMapUnmanaged([]output.AggState) = .empty,
+    arena: std.heap.ArenaAllocator,
+    /// Why scanning the chunk failed. Reported when the chunk's turn comes.
+    scan_err: ?anyerror = null,
+    /// The fields above are ready. Guarded by `Queue.mutex`.
+    done: bool = false,
+};
+
+/// One scanning thread, with its own parser, scratch space and match state.
+const Worker = struct {
+    feed: *Feed,
+    /// The aggregation states every chunk starts from.
+    template: []const output.AggState,
+    search: Search,
+    /// Backs the parser slots, `passed` and the scratch space. Only this worker uses it.
+    arena: std.heap.ArenaAllocator,
+    thread: std.Thread = undefined,
+
+    /// Scans chunk `seq` into its slot's result and marks it done.
+    fn scan(worker: *Worker, seq: usize) void {
+        const feed = worker.feed;
+        const index = seq % feed.chunks.len;
+        const result = &feed.results[index];
+        result.scan_err = null;
+        worker.scanChunk(&feed.chunks[index], result) catch |err| {
+            // Writing into memory only fails when the memory runs out.
+            result.scan_err = if (err == error.WriteFailed) error.OutOfMemory else err;
+        };
+        feed.finish(seq);
+    }
+
+    fn scanChunk(worker: *Worker, chunk: *const Chunk, result: *ChunkResult) !void {
+        result.out.clearRetainingCapacity();
+        result.group_map = .empty;
+        _ = result.arena.reset(.retain_capacity);
+        @memcpy(result.agg_states, worker.template);
+
+        const search = &worker.search;
+        search.writer = &result.out.writer;
+        search.agg_states = result.agg_states;
+        search.group_map = .empty;
+        search.group_alloc = result.arena.allocator();
+        search.match_count = 0;
+        search.lines_seen = chunk.first_line;
+        defer {
+            result.match_count = search.match_count;
+            result.group_map = search.group_map;
+        }
+        // The chunk stops at the limit by itself: more matches than that can't be printed.
+        // Whether fewer are depends on the chunks before it, which `writeInOrder` checks.
+        _ = try search.scanBlock(chunk.input);
+    }
+};
+
+fn workerMain(worker: *Worker) void {
+    while (worker.feed.take()) |seq| worker.scan(seq);
+}
+
+/// A search with its own parser, slots and scratch space, allocated in `allocator`.
+fn initSearch(
+    allocator: std.mem.Allocator,
+    plan: *const compile.CompiledPlan,
+    agg_states: []output.AggState,
+    writer: *std.Io.Writer,
+) !Search {
+    const parser = try allocator.create(json.Parser);
+    parser.* = .{ .trie = &plan.trie, .slots = try allocator.alloc(?[]const u8, plan.trie.slot_count) };
+    return .{
+        .plan = plan,
+        .agg_states = agg_states,
+        .writer = writer,
+        .passed = try allocator.alloc(bool, plan.anchors.len),
+        .scratch = .{ .gpa = allocator },
+        .group_alloc = allocator,
+        .parser = parser,
+    };
+}
+
+/// Where to report the file a read or open error happened in.
+const FailedFile = struct { paths: []const []const u8, failed: *?[]const u8 };
+
+/// Runs the parallel scan on `threads` threads: the calling thread and up to `threads - 1`
+/// workers. `search` writes the output and holds the totals. With `may_block`, the input may
+/// be a pipe whose reads never return, so the feeder is detached at the end instead of joined.
+fn runParallel(
+    search: *Search,
+    source: FeedSource,
+    config: cli.Config,
+    threads: usize,
+    may_block: bool,
+    io: std.Io,
+    failed_file: ?FailedFile,
+) !void {
+    const plan = search.plan;
+    const allocator = search.scratch.gpa;
+    const slot_count = 2 * threads;
+
+    // Every allocation from `allocator` happens here, before any thread starts. Workers
+    // allocate only from page_allocator-backed arenas of their own.
+    const results = try allocator.alloc(ChunkResult, slot_count);
+    for (results) |*result| result.* = .{
+        .out = .init(page_allocator),
+        .agg_states = try allocator.alloc(output.AggState, plan.pluck.len),
+        .arena = .init(page_allocator),
+    };
+    // The last one is the calling thread's, for the chunks it scans while it helps.
+    const workers = try allocator.alloc(Worker, threads);
+    var workers_ready: usize = 0;
+    defer {
+        for (results) |*result| {
+            result.out.deinit();
+            result.arena.deinit();
+        }
+        for (workers[0..workers_ready]) |*worker| worker.arena.deinit();
+    }
+
+    const feed = try Feed.create(source, config, workers[0 .. threads - 1], results, io);
+    feed.count_lines = plan.line_numbers;
+    for (workers) |*worker| {
+        worker.* = .{
+            .feed = feed,
+            .template = search.agg_states,
+            .search = undefined,
+            .arena = .init(page_allocator),
+        };
+        workers_ready += 1;
+        worker.search = initSearch(worker.arena.allocator(), plan, &.{}, undefined) catch |err| {
+            // No thread has started, so this is the only reference.
+            feed.refs.store(1, .monotonic);
+            feed.release();
+            return err;
+        };
+    }
+
+    const feeder = std.Thread.spawn(.{}, feederThread, .{feed}) catch |err| {
+        feed.refs.store(1, .monotonic);
+        feed.release();
+        return err;
+    };
+    defer stopPool(feed, feeder, may_block);
+    return writeInOrder(search, &workers[threads - 1], failed_file);
+}
+
+/// Stops the workers and the feeder, and drops the calling thread's reference to `feed`.
+fn stopPool(feed: *Feed, feeder: std.Thread, may_block: bool) void {
+    const io = feed.io;
+    const queue = &feed.queue;
+    queue.mutex.lockUncancelable(io);
+    feed.stop.store(true, .release);
+    // No worker starts after this, so these are the ones to join.
+    const started = queue.spawned;
+    queue.work.broadcast(io);
+    queue.mutex.unlock(io);
+
+    // Wake the feeder if it waits for a slot. It sees `stop` and returns. A worker in the
+    // middle of a chunk finishes it first.
+    feed.free.post(io);
+    for (feed.workers[0..started]) |*worker| worker.thread.join();
+    if (may_block) feeder.detach() else feeder.join();
+    feed.release();
+}
+
+/// Scans the chunks the workers haven't taken and writes every chunk's output in input
+/// order, until the input ends or the match limit is reached. Errors are reported in input
+/// order too: a chunk's scan error, or the read error after it, comes out after every
+/// earlier chunk's output.
+fn writeInOrder(search: *Search, helper: *Worker, failed_file: ?FailedFile) !void {
+    const feed = helper.feed;
+    const limit = search.plan.limit orelse std.math.maxInt(usize);
+    var seq: usize = 0;
+    while (true) : (seq += 1) {
+        const index = seq % feed.chunks.len;
+        const chunk = &feed.chunks[index];
+        step: switch (feed.nextStep(seq)) {
+            .help => |later| {
+                helper.scan(later);
+                continue :step feed.nextStep(seq);
+            },
+            .scan_head => {
+                // Straight into the output and the totals.
+                search.lines_seen = chunk.first_line;
+                const limit_reached = try search.scanBlock(chunk.input);
+                try search.writer.flush();
+                if (limit_reached) return;
+            },
+            .write_head => {
+                const result = &feed.results[index];
+                if (result.scan_err) |err| return err;
+                if (result.match_count > limit - search.match_count) {
+                    // This chunk reaches the limit, but its worker didn't know how many
+                    // matches came before it, so it printed too many. Scanning it again here,
+                    // where the count is known, stops at exactly the right match.
+                    search.lines_seen = chunk.first_line;
+                    _ = try search.scanBlock(chunk.input);
+                    try search.writer.flush();
+                    return;
+                }
+                try search.writer.writeAll(result.out.written());
+                search.match_count += result.match_count;
+                // Flush per chunk so streaming input (`tail -f`) produces output as it arrives.
+                try search.writer.flush();
+                if (search.match_count == limit) return;
+            },
+        }
+
+        if (chunk.read_err) |err| {
+            // The caller's own path: the feeder's copy is freed when the scan ends.
+            if (failed_file) |failed| failed.failed.* = failed.paths[chunk.file_index.?];
+            return err;
+        }
+        if (chunk.last) return;
+        // Hand the slot back to the feeder.
+        feed.free.post(feed.io);
+    }
 }
 
 /// Runs the query over `config.files` in order, as one input: the limit, counts and
@@ -495,9 +1044,13 @@ pub fn searchStream(allocator: std.mem.Allocator, config: cli.Config, writer: *s
     return try searchOpenFile(allocator, std.Io.File.stdin(), config, writer, io);
 }
 
-/// Runs the query on input already in memory (used by the library API). No reader thread.
+/// Runs the query on input already in memory (used by the library API). Safe to call from
+/// several threads at once: every call has its own threads and state.
 pub fn searchBytes(allocator: std.mem.Allocator, data: []const u8, config: cli.Config, writer: *std.Io.Writer) !usize {
-    return try searchInput(allocator, .{ .bytes = data }, config, writer, undefined);
+    // An `Io` of its own for the threads' semaphores. Single-threaded, so it installs no
+    // signal handlers in a host process; blocking still works across OS threads.
+    var threaded: std.Io.Threaded = .init_single_threaded;
+    return try searchInput(allocator, .{ .bytes = data }, config, writer, threaded.io());
 }
 
 /// Runs the query on an open file and writes its output. Returns the number of matching lines.
@@ -516,6 +1069,69 @@ const Input = union(enum) {
     files: struct { paths: []const []const u8, failed: *?[]const u8 },
     bytes: []const u8,
 };
+
+/// The most workers the default thread count uses. Measured on an Apple M2 Pro (6
+/// performance and 4 efficiency cores): parse-bound queries stop improving at about 8.
+pub const max_default_threads = 8;
+
+/// The thread count when --threads isn't given: one per CPU, up to `max_default_threads`.
+pub fn defaultThreads() usize {
+    const cpus = std.Thread.getCpuCount() catch 1;
+    return @max(1, @min(cpus, max_default_threads));
+}
+
+/// How the input will be scanned.
+const ScanMode = struct {
+    /// Scanning threads, the calling thread included. 1 for the single-threaded scan.
+    threads: usize,
+    /// Some input may be a pipe or terminal, whose reads can block forever.
+    may_block: bool,
+};
+
+/// Inputs up to this many parallel chunks stay single-threaded: they take well under a
+/// millisecond to scan, so starting threads would cost about as much as it saves.
+const min_parallel_chunks = 4;
+
+/// Picks the scan for `input`. Inputs whose size is unknown (pipes) always get the parallel
+/// scan: it only starts workers once chunks pile up (see `Queue.spawned`).
+fn chooseScan(input: Input, config: cli.Config, plan: *const compile.CompiledPlan, io: std.Io) ScanMode {
+    const single: ScanMode = .{ .threads = 1, .may_block = false };
+    const threads = config.threads orelse defaultThreads();
+    if (threads <= 1 or plan.has_aggregations or plan.line_numbers) return single;
+    const probe = probeInput(input, io);
+    const chunk_size: usize = @min(config.block_size, parallel_block_size);
+    if (probe.size) |bytes| if (bytes <= min_parallel_chunks * chunk_size) return single;
+    return .{ .threads = threads, .may_block = probe.may_block };
+}
+
+/// The total size of the input, when it is known up front, and whether some of it may be a
+/// pipe or terminal.
+fn probeInput(input: Input, io: std.Io) struct { size: ?u64, may_block: bool } {
+    switch (input) {
+        .bytes => |data| return .{ .size = data.len, .may_block = false },
+        .file => |file| {
+            const stat = file.stat(io) catch return .{ .size = null, .may_block = true };
+            if (stat.kind != .file) return .{ .size = null, .may_block = true };
+            return .{ .size = stat.size, .may_block = false };
+        },
+        .files => |files| {
+            var total: ?u64 = 0;
+            var may_block = false;
+            for (files.paths) |path| {
+                // A file that can't be stat'ed fails to open too, which ends the input quickly.
+                const stat = std.Io.Dir.cwd().statFile(io, path, .{}) catch {
+                    total = null;
+                    continue;
+                };
+                if (stat.kind != .file) {
+                    may_block = true;
+                    total = null;
+                } else if (total) |sum| total = sum + stat.size;
+            }
+            return .{ .size = total, .may_block = may_block };
+        },
+    }
+}
 
 fn searchInput(
     allocator: std.mem.Allocator,
@@ -542,22 +1158,20 @@ fn searchInput(
 
     try output.printHeader(&plan, writer);
 
-    // The parser and its slots live in the arena, so they outlive the reader thread's use.
-    const parser = try arena.allocator().create(json.Parser);
-    const slots = try arena.allocator().alloc(?[]const u8, plan.trie.slot_count);
-    parser.* = .{ .trie = &plan.trie, .slots = slots };
-
-    var search: Search = .{
-        .plan = &plan,
-        .agg_states = agg_states,
-        .writer = writer,
-        .passed = try arena.allocator().alloc(bool, plan.anchors.len),
-        .scratch = .{ .gpa = arena.allocator() },
-        .parser = parser,
-    };
-    // `--limit 0` can never produce output, so the reader thread is not started at all.
+    var search = try initSearch(arena.allocator(), &plan, agg_states, writer);
+    // `--limit 0` can never produce output, so no thread is started at all.
     const limit_zero = if (plan.limit) |limit| limit == 0 else false;
-    if (!limit_zero) switch (input) {
+    const scan = chooseScan(input, config, &plan, io);
+    if (limit_zero) {
+        // Nothing to scan.
+    } else if (scan.threads > 1) {
+        const source: FeedSource, const failed = switch (input) {
+            .bytes => |data| .{ .{ .bytes = data }, null },
+            .file => |file| .{ .{ .file = file }, null },
+            .files => |files| .{ .{ .files = files.paths }, FailedFile{ .paths = files.paths, .failed = files.failed } },
+        };
+        try runParallel(&search, source, config, scan.threads, scan.may_block, io, failed);
+    } else switch (input) {
         .file => |file| _ = try runSearch(&search, file, config, io),
         .files => |files| for (files.paths) |path| {
             files.failed.* = path;
@@ -570,7 +1184,7 @@ fn searchInput(
             if (!finished) break;
         },
         .bytes => |data| _ = try search.scanBlock(data),
-    };
+    }
 
     if (plan.count_only) {
         try writer.print("{d}\n", .{search.match_count});
@@ -611,13 +1225,17 @@ fn tinyBlockSize(input: []const u8) usize {
     return @max(16, input.len / 24);
 }
 
-/// The ways of running a query that must all give the same output: whole input in one
-/// block, and tiny blocks. Each variant is run on a file and on bytes in memory.
-fn testVariants(config: cli.Config, input: []const u8) [2]cli.Config {
-    var tiny = config;
-    tiny.block_size = tinyBlockSize(input);
-    tiny.stream_block_size = tiny.block_size;
-    return .{ config, tiny };
+/// The ways of running a query that must all give the same output: as given (one block
+/// for small inputs), and in tiny blocks on one thread and on several. Each variant is run
+/// on a file and on bytes in memory.
+fn testVariants(config: cli.Config, input: []const u8) [3]cli.Config {
+    var single = config;
+    single.block_size = tinyBlockSize(input);
+    single.stream_block_size = single.block_size;
+    single.threads = 1;
+    var parallel = single;
+    parallel.threads = 4;
+    return .{ config, single, parallel };
 }
 
 /// Runs `config` through the file path and the in-memory path (used by the library) and
@@ -827,21 +1445,31 @@ test "several files are read in order as one input" {
         .{ .args = &.{ "--limit", "2", "n", "exists", one, two }, .expected = "{\"n\":1}\n{\"n\":2}\n" },
         .{ .args = &.{ "SELECT", "sum:n,count:n", one, two }, .expected = "6\t3\n" },
     };
-    for (cases) |case| {
-        const config = (try cli.parseArgs(a, case.args)).run;
+    // One line per block, so the files span several chunks, on one thread and on several.
+    const Variant = struct { block_size: usize, threads: usize };
+    const variants = [_]Variant{ .{ .block_size = cli.default_block_size, .threads = 1 }, .{ .block_size = 4, .threads = 1 }, .{ .block_size = 4, .threads = 4 } };
+    for (variants) |variant| {
+        for (cases) |case| {
+            var config = (try cli.parseArgs(a, case.args)).run;
+            config.block_size = variant.block_size;
+            config.threads = variant.threads;
+            var out: std.Io.Writer.Allocating = .init(a);
+            var failed: ?[]const u8 = null;
+            _ = try searchFiles(a, config, &out.writer, io, &failed);
+            try testing.expectEqualStrings(case.expected, out.written());
+            try testing.expect(failed == null);
+        }
+
+        // A missing file is reported by name, after the earlier files were searched.
+        var config = (try cli.parseArgs(a, &.{ "n", "exists", one, missing, two })).run;
+        config.block_size = variant.block_size;
+        config.threads = variant.threads;
         var out: std.Io.Writer.Allocating = .init(a);
         var failed: ?[]const u8 = null;
-        _ = try searchFiles(a, config, &out.writer, io, &failed);
-        try testing.expectEqualStrings(case.expected, out.written());
-        try testing.expect(failed == null);
+        try testing.expectError(error.FileNotFound, searchFiles(a, config, &out.writer, io, &failed));
+        try testing.expectEqualStrings(missing, failed.?);
+        try testing.expectEqualStrings("{\"n\":1}\n{\"n\":2}\n", out.written());
     }
-
-    // A missing file is reported by name, after the earlier files were searched.
-    const config = (try cli.parseArgs(a, &.{ "n", "exists", one, missing, two })).run;
-    var out: std.Io.Writer.Allocating = .init(a);
-    var failed: ?[]const u8 = null;
-    try testing.expectError(error.FileNotFound, searchFiles(a, config, &out.writer, io, &failed));
-    try testing.expectEqualStrings(missing, failed.?);
 }
 
 test "line numbers" {
@@ -893,6 +1521,54 @@ test "in values can contain escaped commas" {
     try expectQuery(input, &.{ "a", "in", "x\\,y,z" }, "{\"a\":\"x,y\"}\n{\"a\":\"z\"}\n");
     try expectQuery(input, &.{ "--fast", "a", "in", "x\\,y,z" }, "{\"a\":\"x,y\"}\n{\"a\":\"z\"}\n");
     try expectQuery(input, &.{ "a", "in", "x,y" }, "{\"a\":\"x\"}\n");
+}
+
+test "limit cuts the output at the same match across chunks" {
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    // Matches cluster in some chunks and are absent from others, so the limit falls in
+    // chunks scanned by a worker and in chunks the calling thread scans.
+    var input: std.ArrayList(u8) = .empty;
+    var matches: std.ArrayList(usize) = .empty;
+    for (0..2000) |index| {
+        const hit = (index / 50) % 3 != 1 and index % 7 != 3;
+        try input.print(a, "{{\"i\":{d},\"hit\":{}}}\n", .{ index, hit });
+        if (hit) try matches.append(a, index);
+    }
+    for ([_]usize{ 1, 2, 3, 49, 50, 51, 333, 700, matches.items.len - 1, matches.items.len, matches.items.len + 1 }) |limit| {
+        var expected: std.ArrayList(u8) = .empty;
+        for (matches.items[0..@min(limit, matches.items.len)]) |index| try expected.print(a, "{d}\n", .{index});
+        const limit_arg = try std.fmt.allocPrint(a, "{d}", .{limit});
+        try expectQuery(input.items, &.{ "--limit", limit_arg, "SELECT", "i", "WHERE", "hit", "eq", "true" }, expected.items);
+        const count = try std.fmt.allocPrint(a, "{d}\n", .{@min(limit, matches.items.len)});
+        try expectQuery(input.items, &.{ "--limit", limit_arg, "-c", "hit", "eq", "true" }, count);
+    }
+}
+
+test "a failing writer stops the parallel scan" {
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    var input: std.ArrayList(u8) = .empty;
+    for (0..5000) |index| try input.print(a, "{{\"i\":{d}}}\n", .{index});
+    var config = (try cli.parseArgs(a, &.{ "i", "exists" })).run;
+    config.block_size = 256;
+    config.threads = 4;
+    // The output fills the writer's buffer early on. The scan must report the failure and
+    // return, with every thread stopped (testing.allocator would report leaked memory).
+    var buf: [1000]u8 = undefined;
+    var fixed: std.Io.Writer = .fixed(&buf);
+    try testing.expectError(error.WriteFailed, searchBytes(testing.allocator, input.items, config, &fixed));
+
+    const io = testing.io;
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+    try tmp.dir.writeFile(io, .{ .sub_path = "in.jsonl", .data = input.items });
+    const file = try tmp.dir.openFile(io, "in.jsonl", .{});
+    defer file.close(io);
+    fixed = .fixed(&buf);
+    try testing.expectError(error.WriteFailed, searchOpenFile(testing.allocator, file, config, &fixed, io));
 }
 
 test "limit 0 outputs nothing" {
@@ -1165,15 +1841,20 @@ test "differential: the prefilter never drops a line the parser accepts" {
             if (rand.boolean()) try args.insertSlice(a, 0, &.{ "SELECT", "a,a.b,p1" });
 
             const config = (try cli.parseArgs(a, args.items)).run;
-            const got = try runTestQuery(a, gen.out.items, config);
             var unfiltered = config;
             unfiltered.prefilter = false;
+            unfiltered.threads = 1;
             const want = try runTestQuery(a, gen.out.items, unfiltered);
-            if (!std.mem.eql(u8, want, got)) {
-                std.debug.print("query:", .{});
-                for (args.items) |t| std.debug.print(" '{s}'", .{t});
-                std.debug.print("\nwant:\n{s}\ngot:\n{s}\n", .{ want, got });
-                return error.TestUnexpectedResult;
+            // The prefilter, and splitting the input into chunks scanned on several threads,
+            // never change the output.
+            for (testVariants(config, gen.out.items)) |variant| {
+                const got = try runTestQuery(a, gen.out.items, variant);
+                if (!std.mem.eql(u8, want, got)) {
+                    std.debug.print("query (block size {d}, threads {?d}):", .{ variant.block_size, variant.threads });
+                    for (args.items) |t| std.debug.print(" '{s}'", .{t});
+                    std.debug.print("\nwant:\n{s}\ngot:\n{s}\n", .{ want, got });
+                    return error.TestUnexpectedResult;
+                }
             }
         }
     }

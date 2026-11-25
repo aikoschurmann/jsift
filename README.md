@@ -585,7 +585,7 @@ Match queries are timed with `-c` on both jsift and ripgrep, because ripgrep sto
 - **CLI workflows:** chain with `sort`, `uniq`, `awk` and friends
 - **Live monitoring:** filter `tail -f` or `journalctl -f` output as it arrives
 
-**Not suitable for:** validating JSON, queries that depend on nesting, pretty-printed JSON, or formats other than JSONL.
+**Not suitable for:** validating JSON (invalid lines are skipped, not reported), indexing into arrays, pretty-printed JSON, or formats other than JSONL.
 
 ---
 

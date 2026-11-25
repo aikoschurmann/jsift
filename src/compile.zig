@@ -54,6 +54,11 @@ pub const CompiledPlan = struct {
     /// Index into `anchor_finder.finders` of each anchor's key.
     anchor_keys: []const usize,
     pluck: []CompiledPluck,
+    /// GROUP BY keys. Empty when the query isn't grouped.
+    group_keys: []CompiledPluck,
+    /// Per pluck: for a plain field, the index of the group key it names. Grouped queries only.
+    pluck_group: []const ?usize,
+    /// Running totals instead of rows: SELECT has an aggregation, or the query is grouped.
     has_aggregations: bool,
     /// Lines the byte-level search can't rule out are validated and evaluated by parsing.
     /// Off with --fast, which evaluates on the bytes alone.
@@ -302,9 +307,29 @@ fn compilePlucks(
     return compiled;
 }
 
-/// Hands each condition and pluck the slot the trie gave its path. The paths were appended
-/// conditions first (group by group), then plucks, and the slots follow that order.
-fn assignSlots(groups: []CompiledGroup, plucks: []CompiledPluck, path_slots: []const u32) void {
+/// For a grouped query, the group key that each plain SELECT field names. A plain field that
+/// isn't a group key has no single value per group, so it is an error.
+fn mapPlucksToGroups(
+    allocator: std.mem.Allocator,
+    plucks: []const cli.PluckField,
+    group_by: []const []const u8,
+) ![]const ?usize {
+    if (group_by.len == 0) return &.{};
+    const mapping = try allocator.alloc(?usize, plucks.len);
+    for (plucks, mapping) |pluck, *group_index| {
+        group_index.* = null;
+        if (pluck.ptype != .raw) continue;
+        group_index.* = for (group_by, 0..) |key, index| {
+            if (std.mem.eql(u8, key, pluck.key)) break index;
+        } else return error.UngroupedField;
+    }
+    return mapping;
+}
+
+/// Hands each condition, pluck and group key the slot the trie gave its path. The paths were
+/// appended conditions first (group by group), then plucks, then group keys, and the slots
+/// follow that order.
+fn assignSlots(groups: []CompiledGroup, plucks: []CompiledPluck, group_keys: []CompiledPluck, path_slots: []const u32) void {
     var next_path: usize = 0;
 
     for (groups) |group| {
@@ -315,6 +340,10 @@ fn assignSlots(groups: []CompiledGroup, plucks: []CompiledPluck, path_slots: []c
     }
     for (plucks) |*pluck| {
         pluck.slot = path_slots[next_path];
+        next_path += 1;
+    }
+    for (group_keys) |*key| {
+        key.slot = path_slots[next_path];
         next_path += 1;
     }
 }
@@ -331,14 +360,19 @@ pub fn compilePlan(allocator: std.mem.Allocator, config: cli.Config) !CompiledPl
     const anchor_keys = try collectNeedles(allocator, anchors, &needles, &hazards);
 
     const plucks = try compilePlucks(allocator, config.pluck, &paths);
-    // An aggregation in SELECT (count, sum, ...) makes the query compute running totals.
-    const has_aggregations = for (config.pluck) |pluck| {
+    // Group keys are compiled like plain SELECT fields: a path and a finder each.
+    const group_fields = try allocator.alloc(cli.PluckField, config.group_by.len);
+    for (config.group_by, group_fields) |key, *field| field.* = .{ .key = key, .ptype = .raw, .original_str = key };
+    const group_keys = try compilePlucks(allocator, group_fields, &paths);
+    const pluck_group = try mapPlucksToGroups(allocator, config.pluck, config.group_by);
+    // An aggregation in SELECT (count, sum, ...) or GROUP BY makes the query compute running totals.
+    const has_aggregations = config.group_by.len > 0 or for (config.pluck) |pluck| {
         if (pluck.ptype != .raw) break true;
     } else false;
 
     const path_slots = try allocator.alloc(u32, paths.items.len);
     const trie = try json.PathTrie.init(allocator, paths.items, path_slots);
-    assignSlots(groups, plucks, path_slots);
+    assignSlots(groups, plucks, group_keys, path_slots);
 
     var anchor_finder: finder.MultiFinder = try .init(allocator, needles.items);
     anchor_finder.hazards = hazards;
@@ -349,6 +383,8 @@ pub fn compilePlan(allocator: std.mem.Allocator, config: cli.Config) !CompiledPl
         .anchor_finder = anchor_finder,
         .anchor_keys = anchor_keys,
         .pluck = plucks,
+        .group_keys = group_keys,
+        .pluck_group = pluck_group,
         .has_aggregations = has_aggregations,
         .exact = !config.fast,
         .prefilter = config.prefilter,

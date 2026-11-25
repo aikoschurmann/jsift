@@ -125,7 +125,8 @@ fn writeNumber(writer: *std.Io.Writer, number: Number) !void {
 
 /// The running state of one SELECT field. `raw` fields are plain values, not aggregations.
 pub const AggState = union(enum) {
-    raw: void,
+    /// A plain field. In a grouped query it holds the group's value for that field.
+    raw: ?Value,
     count: usize,
     sum: Sum,
     min: Extreme,
@@ -223,6 +224,24 @@ fn writeJsonKey(writer: *std.Io.Writer, name: []const u8) !void {
     try writer.writeAll("\": ");
 }
 
+/// Writes one field value in `format`. JSON keeps a string's raw text, which still has its
+/// escapes, between quotes; other values are valid JSON as they are. CSV quotes and decodes.
+/// TSV writes the raw text unchanged, so string escapes stay escaped and a value can't put a
+/// literal tab or newline into the row.
+inline fn writeValue(value: Value, comptime format: cli.OutputFormat, writer: *std.Io.Writer) !void {
+    switch (format) {
+        .json => if (value.is_string) {
+            try writer.writeByte('"');
+            try writer.writeAll(value.raw);
+            try writer.writeByte('"');
+        } else {
+            try writer.writeAll(value.raw);
+        },
+        .csv => try writeCsvField(writer, value),
+        .tsv => try writer.writeAll(value.raw),
+    }
+}
+
 /// Writes the SELECT fields of one matching line. A missing field is empty, or `null` in JSON.
 pub fn printFormatted(
     results: []const ?Value,
@@ -236,36 +255,15 @@ pub fn printFormatted(
             for (results, plucks, 0..) |result, pluck, index| {
                 if (index > 0) try writer.writeAll(", ");
                 try writeJsonKey(writer, pluck.original_str);
-
-                // A string's raw text still has its JSON escapes, so it is written between
-                // quotes unchanged. Other values are valid JSON as they are.
-                if (result) |value| {
-                    if (value.is_string) {
-                        try writer.writeByte('"');
-                        try writer.writeAll(value.raw);
-                        try writer.writeByte('"');
-                    } else {
-                        try writer.writeAll(value.raw);
-                    }
-                } else {
-                    try writer.writeAll("null");
-                }
+                if (result) |value| try writeValue(value, .json, writer) else try writer.writeAll("null");
             }
             try writer.writeAll("}\n");
         },
-        .csv => {
+        inline .csv, .tsv => |row_format| {
+            const separator: u8 = if (row_format == .csv) ',' else '\t';
             for (results, 0..) |result, index| {
-                if (index > 0) try writer.writeByte(',');
-                if (result) |value| try writeCsvField(writer, value);
-            }
-            try writer.writeByte('\n');
-        },
-        .tsv => {
-            // Raw text is written unchanged. String escapes stay escaped, so a value cannot
-            // put a literal tab or newline into the row.
-            for (results, 0..) |result, index| {
-                if (index > 0) try writer.writeByte('\t');
-                if (result) |value| try writer.writeAll(value.raw);
+                if (index > 0) try writer.writeByte(separator);
+                if (result) |value| try writeValue(value, row_format, writer);
             }
             try writer.writeByte('\n');
         },
@@ -274,10 +272,15 @@ pub fn printFormatted(
 
 /// Writes one aggregation value. An aggregation with nothing folded in has no value: it is
 /// `null` in JSON (`with_nulls`) and an empty field in TSV and CSV. A sum of nothing is 0.
-inline fn formatAggValue(state: AggState, comptime with_nulls: bool, writer: *std.Io.Writer) !void {
+inline fn formatAggValue(state: AggState, comptime format: cli.OutputFormat, writer: *std.Io.Writer) !void {
+    const with_nulls = format == .json;
     switch (state) {
-        .raw => {
-            if (with_nulls) try writer.writeAll("null");
+        .raw => |maybe_value| {
+            if (maybe_value) |value| {
+                try writeValue(value, format, writer);
+            } else if (with_nulls) {
+                try writer.writeAll("null");
+            }
         },
         .count => |count| try writer.print("{d}", .{count}),
         .sum => |sum| try writeNumber(writer, sum.total()),
@@ -310,14 +313,19 @@ pub fn printAggregations(
         for (agg_states, 0..) |state, index| {
             if (index > 0) try writer.writeAll(", ");
             try writeJsonKey(writer, plucks[index].original_str);
-            try formatAggValue(state, true, writer);
+            try formatAggValue(state, .json, writer);
         }
         try writer.writeAll("}\n");
-    } else {
-        const separator: u8 = if (format == .csv) ',' else '\t';
+    } else if (format == .csv) {
         for (agg_states, 0..) |state, index| {
-            try formatAggValue(state, false, writer);
-            if (index < agg_states.len - 1) try writer.writeByte(separator);
+            if (index > 0) try writer.writeByte(',');
+            try formatAggValue(state, .csv, writer);
+        }
+        try writer.writeByte('\n');
+    } else {
+        for (agg_states, 0..) |state, index| {
+            if (index > 0) try writer.writeByte('\t');
+            try formatAggValue(state, .tsv, writer);
         }
         try writer.writeByte('\n');
     }

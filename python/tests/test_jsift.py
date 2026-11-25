@@ -122,3 +122,11 @@ def test_large_input():
 def test_parentheses():
     rows = jsift.search("(name eq a OR name eq b) AND age exists", data='{"name":"a","age":1}\n{"name":"b"}\n{"name":"c","age":2}\n')
     assert rows == [{"name": "a", "age": 1}]
+
+
+def test_group_by():
+    rows = jsift.select("level,count:name,max:age GROUP BY level", data=DATA)
+    assert rows == [
+        {"level": "error", "count:name": 2, "max:age": 31},
+        {"level": "info", "count:name": 1, "max:age": 40},
+    ]

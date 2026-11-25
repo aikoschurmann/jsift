@@ -24,6 +24,8 @@ pub const Config = struct {
     file_path: ?[]const u8 = null,
     groups: []ConditionGroup,
     pluck: []PluckField,
+    /// GROUP BY keys: one aggregation row per distinct combination of their values.
+    group_by: []const []const u8 = &.{},
     format: OutputFormat = .tsv,
     limit: ?usize = null,
     count_only: bool = false,
@@ -43,7 +45,7 @@ pub fn printUsage() void {
     std.debug.print(
         \\jsift - search JSONL with SIMD
         \\
-        \\Usage: jsift [--file <path>] [--format json|csv|tsv] [SELECT <fields> WHERE] <key> <op> <val> [AND/OR ...]
+        \\Usage: jsift [--file <path>] [--format json|csv|tsv] [SELECT <fields> WHERE] <key> <op> <val> [AND/OR ...] [GROUP BY <keys>]
         \\
         \\Options:
         \\  --file <path>       Path to JSONL file (reads from stdin if omitted)
@@ -66,6 +68,7 @@ pub fn printUsage() void {
         \\  AND / OR:  Chain conditions                               (e.g. level eq error AND code gt 500)
         \\  ( ):       Group; AND binds tighter than OR otherwise     (e.g. '(' level eq error OR level eq warn ')' AND code gt 500)
         \\  Aggregations: count:field, sum:field, min:field, max:field, avg:field
+        \\  GROUP BY:  One aggregate row per value, at the end         (e.g. SELECT svc,count:id GROUP BY svc)
         \\
         \\Exit Codes:
         \\  0  At least one match found
@@ -132,6 +135,21 @@ fn parseSelectClause(
     const fields = try pluck_keys.toOwnedSlice(allocator);
     if (fields.len > max_pluck_fields) return error.TooManyPluckFields;
     return .{ .fields = fields, .next_token = token_index };
+}
+
+/// Parses the comma-separated keys after GROUP BY, which may be spread over several tokens
+/// (`GROUP BY a,b` or `GROUP BY a, b`).
+fn parseGroupKeys(allocator: std.mem.Allocator, tokens: []const []const u8) ![]const []const u8 {
+    var keys: std.ArrayList([]const u8) = .empty;
+    for (tokens) |token| {
+        var items = std.mem.splitScalar(u8, token, ',');
+        while (items.next()) |key| {
+            if (key.len > 0) try keys.append(allocator, key);
+        }
+    }
+    if (keys.items.len == 0) return error.InvalidGroupBy;
+    if (keys.items.len > max_pluck_fields) return error.TooManyPluckFields;
+    return keys.toOwnedSlice(allocator);
 }
 
 /// Splits an aggregation prefix (`count:`, `sum:`, ...) off a SELECT field.
@@ -382,20 +400,33 @@ pub fn parseArgs(allocator: std.mem.Allocator, args: []const []const u8) !Comman
         }
     }
 
+    // GROUP BY, if present, comes last. Everything after it is the group keys.
+    var query_tokens = tokens.items;
+    for (query_tokens, 0..) |token, index| {
+        if (index + 1 < query_tokens.len and std.ascii.eqlIgnoreCase(token, "group") and
+            std.ascii.eqlIgnoreCase(query_tokens[index + 1], "by"))
+        {
+            config.group_by = try parseGroupKeys(allocator, query_tokens[index + 2 ..]);
+            query_tokens = query_tokens[0..index];
+            break;
+        }
+    }
+
     // SELECT, if present, comes first among the query tokens.
     var next_token: usize = 0;
-    if (next_token < tokens.items.len and isKeyword(
-        tokens.items[next_token],
-        if (next_token + 1 < tokens.items.len) tokens.items[next_token + 1] else null,
+    if (next_token < query_tokens.len and isKeyword(
+        query_tokens[next_token],
+        if (next_token + 1 < query_tokens.len) query_tokens[next_token + 1] else null,
         "select",
     )) {
         next_token += 1;
-        const select = try parseSelectClause(allocator, tokens.items, next_token);
+        const select = try parseSelectClause(allocator, query_tokens, next_token);
         config.pluck = select.fields;
         next_token = select.next_token;
     }
+    if (config.group_by.len > 0 and config.pluck.len == 0) return error.GroupWithoutSelect;
 
-    config.groups = try parseWhereClause(allocator, tokens.items, next_token);
+    config.groups = try parseWhereClause(allocator, query_tokens, next_token);
 
     if (config.groups.len == 0 and config.pluck.len == 0 and !config.count_only) {
         return error.MissingArguments;
@@ -440,6 +471,16 @@ test "parseArgs flags and errors" {
     try std.testing.expect(not_not_key.groups[0].conditions[0].negated);
     const where_key = (try parseArgs(allocator, &.{ "SELECT", "a", "WHERE", "where", "eq", "1" })).run;
     try std.testing.expectEqualStrings("where", where_key.groups[0].conditions[0].key);
+
+    const grouped = (try parseArgs(allocator, &.{ "SELECT", "s,count:x", "WHERE", "a", "exists", "GROUP", "BY", "s,", "t" })).run;
+    try std.testing.expectEqual(@as(usize, 2), grouped.group_by.len);
+    try std.testing.expectEqualStrings("t", grouped.group_by[1]);
+    try std.testing.expectEqual(@as(usize, 1), grouped.groups.len);
+    const grouped_no_where = (try parseArgs(allocator, &.{ "select", "group,count:x", "group", "by", "group" })).run;
+    try std.testing.expectEqualStrings("group", grouped_no_where.group_by[0]);
+    try std.testing.expectEqualStrings("group", grouped_no_where.pluck[0].key);
+    try std.testing.expectError(error.GroupWithoutSelect, parseArgs(allocator, &.{ "a", "exists", "GROUP", "BY", "s" }));
+    try std.testing.expectError(error.InvalidGroupBy, parseArgs(allocator, &.{ "SELECT", "count:x", "GROUP", "BY" }));
 
     const limit0 = (try parseArgs(allocator, &.{ "--limit", "0", "a", "exists" })).run;
     try std.testing.expectEqual(@as(?usize, 0), limit0.limit);

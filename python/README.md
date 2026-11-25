@@ -48,7 +48,7 @@ language is the same as the CLI's:
 | Logic | `AND`, `OR` (AND binds tighter), `NOT`, parentheses: `(a eq 1 OR b eq 2) AND c exists` |
 | Paths | `user.id` for nested keys, `a\.b` for a literal dot |
 | Types | auto-detected; force with `s:` (string), `n:` (number), `b:true` |
-| Aggregations | `count:f`, `sum:f`, `min:f`, `max:f`, `avg:f` |
+| Aggregations | `count:f`, `sum:f`, `min:f`, `max:f`, `avg:f`, per group with `GROUP BY f` |
 
 An invalid query, or a file that can't be read, raises `jsift.JsiftError`.
 

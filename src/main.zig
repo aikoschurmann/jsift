@@ -24,6 +24,8 @@ pub fn main(init: std.process.Init) u8 {
             error.InvalidLimit => "jsift: --limit must be a non-negative integer",
             error.MissingFormatValue => "jsift: --format needs json, csv or tsv",
             error.InvalidCondition => "jsift: incomplete condition, expected <key> <op> <val>",
+            error.GroupWithoutSelect => "jsift: GROUP BY needs a SELECT, e.g. SELECT service,count:id GROUP BY service",
+            error.InvalidGroupBy => "jsift: GROUP BY needs at least one key",
             error.UnbalancedParentheses => "jsift: unbalanced parentheses",
             error.QueryTooComplex => "jsift: query too complex: its parentheses expand to more than 1024 OR groups",
             error.UnknownOperator => "jsift: unknown operator (eq, neq, gt, lt, gte, lte, has, exists, in)",
@@ -80,6 +82,7 @@ pub fn main(init: std.process.Init) u8 {
                 std.debug.print("jsift: write error: {s}\n", .{@errorName(write_err)});
             },
             error.NonNumericComparison => std.debug.print("jsift: gt, lt, gte and lte need a numeric value.\n", .{}),
+            error.UngroupedField => std.debug.print("jsift: with GROUP BY, every plain SELECT field must be a group key.\n", .{}),
             error.InvalidKey => std.debug.print("jsift: keys can't be empty or have empty path segments.\n", .{}),
             error.FileNotFound => std.debug.print("jsift: {s}: No such file\n", .{config.file_path.?}),
             else => if (config.file_path) |path|

@@ -37,7 +37,7 @@ A SIMD query engine for line-delimited JSON, for the command line and Python.</p
 
 - **Fast.** A SIMD search over the raw bytes rules out every line that provably can't match, so most of the file is never parsed. 20–60x faster than `jq`/`jaq`, and up to 10 GB/s with `--fast`.
 - **Exact.** Lines that might match go through a validating JSON parser that decides exactly. Nested paths, escapes and numbers like `9e1` work as in `jq`.
-- **A query language you already know.** Filter with `eq`, `gt`, `has`, `in`, `AND`/`OR`/`NOT`, pull out fields with `SELECT`, and compute `count`/`sum`/`avg`/`min`/`max`.
+- **A query language you already know.** Filter with `eq`, `gt`, `has`, `in`, `AND`/`OR`/`NOT` and parentheses, pull out fields with `SELECT`, and compute `count`/`sum`/`avg`/`min`/`max`, optionally `GROUP BY` a field.
 - **Python, too.** `pip install jsift` runs the same engine in-process, with the GIL released.
 - **Streams.** Works on `tail -f`, prints matches as they arrive, and exits like `grep`.
 - **No dependencies.** One static binary, or one wheel per platform.
@@ -86,8 +86,8 @@ The Linux binary targets baseline x86_64 so that it runs on any 64-bit CPU. That
 # Filter: print matching lines
 jsift --file app.jsonl level eq error AND status gte 500
 
-# Extract fields and aggregate
-jsift --file app.jsonl SELECT service,count:bytes,avg:latency_ms WHERE status eq 200
+# Extract fields and aggregate, per service
+jsift --file app.jsonl SELECT service,count:bytes,avg:latency_ms WHERE status eq 200 GROUP BY service
 
 # Follow a live log
 tail -f app.jsonl | jsift level eq error
@@ -164,7 +164,7 @@ Most queries run at about 10 GB/s, on par with ripgrep's plain fixed-string coun
 ## Usage
 
 ```text
-jsift [options] [SELECT <fields> [WHERE]] <condition> [AND|OR <condition> ...]
+jsift [options] [SELECT <fields> [WHERE]] <condition> [AND|OR <condition> ...] [GROUP BY <keys>]
 ```
 
 jsift reads the file given with `--file`, or standard input when it is omitted.
@@ -371,6 +371,29 @@ cat demo.jsonl | jsift SELECT sum:balance
 - Results print in their shortest form. Sums, minimums and maximums of integers are exact, at any size. Other results are rounded to 15 significant digits, so `0.1 + 0.2` sums to `0.3`.
 - Numbers stored as strings (`"99.99"`) are included. Values that aren't JSON numbers (`"abc"`, `"nan"`, `"inf"`) are skipped.
 - If `SELECT` contains **any** aggregate, jsift prints one summary row at the end. Plain fields in that row come out empty (TSV/CSV) or `null` (JSON): `SELECT name,count:name` prints an empty column, then `4`.
+
+### Grouping (GROUP BY)
+
+`GROUP BY` goes at the end of the query and prints one aggregate row per distinct value of its keys:
+
+```bash
+jsift --file logs.jsonl SELECT service,count:bytes,avg:latency_ms WHERE level eq error GROUP BY service
+# shipping  66643   451.002028870249
+# auth      66903   450.276507645397
+# ...
+
+jsift --file demo.jsonl --format json SELECT active,count:name GROUP BY active
+# {"active": true, "count:name": 3}
+# {"active": false, "count:name": 1}
+# {"active": "true", "count:name": 1}      (Eve's string "true" is a group of its own)
+
+jsift --file app.jsonl SELECT service,level,count:id GROUP BY service,level
+```
+
+- Every plain field in `SELECT` must be one of the group keys, since anything else has no single value per group. Group keys don't have to be selected.
+- Groups are printed in the order they're first seen. Pipe through `sort` to order them.
+- Values group exactly: strings are compared after decoding their escapes, and a string never groups with a number (`"1"` and `1` are separate groups). A missing key is a group of its own, printed empty (TSV/CSV) or `null` (JSON).
+- `SELECT level GROUP BY level`, without aggregates, lists the distinct values.
 
 ### Pipelines and scripting
 

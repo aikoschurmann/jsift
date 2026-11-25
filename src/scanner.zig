@@ -24,6 +24,53 @@ const Search = struct {
     /// The exact layer. After a successful `exactLineMatches`, its slots hold the line's values.
     parser: *json.Parser,
     match_count: usize = 0,
+    /// GROUP BY: the aggregation states of each group, by encoded key, in first-seen order.
+    /// `agg_states` is then only the template that new groups are copied from.
+    group_map: std.StringArrayHashMapUnmanaged([]output.AggState) = .empty,
+    /// The encoded key of the current line's group, reused between lines.
+    group_key: std.ArrayList(u8) = .empty,
+
+    /// The aggregation states of the group `line` belongs to, created on first sight. The
+    /// key encodes each group value as a type byte, its length and its text, with strings
+    /// decoded, so `"a"` and `"\u0061"` share a group but `"1"` and `1` don't.
+    fn groupStates(self: *Search, line: []const u8) ![]output.AggState {
+        const plan = self.plan;
+        const gpa = self.scratch.gpa;
+        var key_values: [cli.max_pluck_fields]?values.Value = undefined;
+        self.group_key.clearRetainingCapacity();
+
+        for (plan.group_keys, key_values[0..plan.group_keys.len]) |*key, *key_value| {
+            key_value.* = if (plan.exact)
+                values.slotValue(self.parser.slots[key.slot])
+            else
+                values.extractField(line, &key.finder);
+            const value = key_value.* orelse {
+                try self.group_key.append(gpa, 0);
+                continue;
+            };
+            const escaped = value.is_string and std.mem.findScalar(u8, value.raw, '\\') != null;
+            const text = if (value.is_string)
+                try values.stringText(.{ .raw = value.raw, .escaped = escaped }, &self.scratch)
+            else
+                value.raw;
+            try self.group_key.append(gpa, if (value.is_string) 1 else 2);
+            try self.group_key.appendSlice(gpa, std.mem.asBytes(&text.len));
+            try self.group_key.appendSlice(gpa, text);
+        }
+
+        const entry = try self.group_map.getOrPut(gpa, self.group_key.items);
+        if (!entry.found_existing) {
+            // The key and values point into the input buffer, which is reused, so they are copied.
+            entry.key_ptr.* = try gpa.dupe(u8, self.group_key.items);
+            const states = try gpa.dupe(output.AggState, self.agg_states);
+            for (plan.pluck_group, states) |group_index, *state| {
+                const value = key_values[group_index orelse continue] orelse continue;
+                state.* = .{ .raw = .{ .raw = try gpa.dupe(u8, value.raw), .is_string = value.is_string } };
+            }
+            entry.value_ptr.* = states;
+        }
+        return entry.value_ptr.*;
+    }
 
     /// Records a matching line. Returns true once the match limit is reached.
     fn emit(self: *Search, line_raw: []const u8) !bool {
@@ -53,7 +100,8 @@ const Search = struct {
         }
 
         if (plan.has_aggregations) {
-            for (results[0..plan.pluck.len], self.agg_states) |result, *state| {
+            const states = if (plan.group_keys.len > 0) try self.groupStates(line) else self.agg_states;
+            for (results[0..plan.pluck.len], states) |result, *state| {
                 if (result) |value| try output.accumulate(state, value, &self.scratch);
             }
         } else {
@@ -441,7 +489,7 @@ fn searchInput(
     var agg_states = try arena.allocator().alloc(output.AggState, plan.pluck.len);
     for (plan.pluck, 0..) |pluck, index| {
         agg_states[index] = switch (pluck.ptype) {
-            .raw => .raw,
+            .raw => .{ .raw = null },
             .count => .{ .count = 0 },
             .sum => .{ .sum = .{} },
             .min => .{ .min = .{} },
@@ -474,6 +522,8 @@ fn searchInput(
 
     if (plan.count_only) {
         try writer.print("{d}\n", .{search.match_count});
+    } else if (plan.group_keys.len > 0) {
+        for (search.group_map.values()) |states| try output.printAggregations(states, plan.pluck, plan.format, writer);
     } else if (plan.has_aggregations) {
         try output.printAggregations(agg_states, plan.pluck, plan.format, writer);
     }
@@ -649,6 +699,37 @@ test "aggregates print exact, shortest numbers" {
     try expectQuery("{\"b\":2.0}\n{\"b\":-0.0}\n", &.{ "SELECT", "sum:b,min:b" }, "2\t0\n");
     try expectQuery("{\"b\":1e300}\n{\"b\":1e-9}\n", &.{ "SELECT", "max:b,min:b" }, "1e300\t1e-9\n");
     try expectQuery("{\"b\":1e400}\n{\"b\":1}\n", &.{ "SELECT", "sum:b" }, "inf\n");
+}
+
+test "GROUP BY" {
+    const input =
+        \\{"svc":"auth","ms":10,"ok":true}
+        \\{"svc":"api","ms":30,"ok":false}
+        \\{"svc":"auth","ms":20,"ok":true}
+        \\{"svc":"\u0061pi","ms":50,"ok":true}
+        \\{"ms":5}
+        \\{"svc":1,"ms":1}
+        \\{"svc":"1","ms":2}
+        \\
+    ;
+    // Groups come out in first-seen order. Escapes are decoded for the key, so "\u0061pi" is
+    // "api"; a missing key is a group of its own; "1" and 1 are different groups. A group
+    // prints the spelling it was first seen with.
+    try expectQuery(input, &.{ "SELECT", "svc,count:ms,sum:ms,avg:ms", "GROUP", "BY", "svc" }, "auth\t2\t30\t15\napi\t2\t80\t40\n\t1\t5\t5\n1\t1\t1\t1\n1\t1\t2\t2\n");
+    try expectQuery(input, &.{ "SELECT", "svc,max:ms", "WHERE", "ok", "eq", "b:true", "GROUP", "BY", "svc" }, "auth\t20\n\\u0061pi\t50\n");
+    try expectQuery(input, &.{ "--format", "json", "SELECT", "count:ms,svc", "WHERE", "svc", "exists", "GROUP", "BY", "svc" }, "{\"count:ms\": 2, \"svc\": \"auth\"}\n{\"count:ms\": 2, \"svc\": \"api\"}\n{\"count:ms\": 1, \"svc\": 1}\n{\"count:ms\": 1, \"svc\": \"1\"}\n");
+    // Several keys, and keys that aren't selected.
+    try expectQuery(input, &.{ "SELECT", "svc,ok,count:ms", "WHERE", "ok", "exists", "GROUP", "BY", "svc,ok" }, "auth\ttrue\t2\napi\tfalse\t1\n\\u0061pi\ttrue\t1\n");
+    try expectQuery(input, &.{ "SELECT", "count:ms", "WHERE", "ok", "exists", "GROUP", "BY", "ok" }, "3\n1\n");
+    // SELECT without aggregations lists the distinct values; nothing matched prints nothing.
+    try expectQuery(input, &.{ "SELECT", "ok", "GROUP", "BY", "ok" }, "true\nfalse\n\n");
+    try expectQuery(input, &.{ "SELECT", "svc,count:ms", "WHERE", "nope", "exists", "GROUP", "BY", "svc" }, "");
+    try expectQuery(demo, &.{ "--header", "--format", "csv", "SELECT", "active,count:name", "GROUP", "BY", "active" }, "active,count:name\n\"true\",3\n\"false\",1\n\"true\",1\n");
+
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const config = (try cli.parseArgs(arena.allocator(), &.{ "SELECT", "svc,ms", "GROUP", "BY", "svc" })).run;
+    try testing.expectError(error.UngroupedField, searchBytes(arena.allocator(), input, config, undefined));
 }
 
 test "parentheses group conditions" {

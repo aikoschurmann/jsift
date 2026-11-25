@@ -54,7 +54,7 @@ pub fn printUsage() void {
         \\  --fast              Match on raw bytes only: faster, but approximate (keys at any depth,
         \\                      no escape decoding, no validation)
         \\  --help, -h          Show this help message
-        \\  --version, -v       Show version
+        \\  --version, -V       Show version
         \\  --                  Treat all following arguments as query terms
         \\
         \\Query Syntax:
@@ -241,8 +241,12 @@ pub fn parseArgs(allocator: std.mem.Allocator, args: []const []const u8) !Comman
             } else return error.InvalidFormat;
         } else if (std.mem.eql(u8, arg, "--help") or std.mem.eql(u8, arg, "-h")) {
             return .help;
-        } else if (std.mem.eql(u8, arg, "--version") or std.mem.eql(u8, arg, "-v")) {
+        } else if (std.mem.eql(u8, arg, "--version") or std.mem.eql(u8, arg, "-V")) {
             return .version;
+        } else if (std.mem.eql(u8, arg, "-v")) {
+            // grep's -v inverts the match. Rejected rather than read as a key, so it can't
+            // silently do something else.
+            return error.InvertOption;
         } else if (std.mem.eql(u8, arg, "--count") or std.mem.eql(u8, arg, "-c")) {
             config.count_only = true;
         } else if (std.mem.eql(u8, arg, "--header")) {
@@ -287,6 +291,8 @@ test "parseArgs flags and errors" {
     try std.testing.expectError(error.InvalidCondition, parseArgs(allocator, &.{ "a", "exists", "AND", "NOT" }));
     try std.testing.expectError(error.MissingArguments, parseArgs(allocator, &.{}));
     try std.testing.expectEqual(Command.help, try parseArgs(allocator, &.{ "a", "--help" }));
+    try std.testing.expectEqual(Command.version, try parseArgs(allocator, &.{ "-V", "a", "exists" }));
+    try std.testing.expectError(error.InvertOption, parseArgs(allocator, &.{ "-v", "a", "exists" }));
 
     // `--` lets query terms start with dashes; negative numbers never needed it.
     const dashed = (try parseArgs(allocator, &.{ "--", "--weird", "eq", "--x" })).run;

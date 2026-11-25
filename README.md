@@ -180,7 +180,7 @@ jsift reads the file given with `--file`, or standard input when it is omitted.
 | `--limit <n>` | Stop after `n` matches |
 | `--fast` | Match on the raw bytes only, without the exact parse: faster, but approximate (see [Limitations](#limitations--trade-offs)) |
 | `--help`, `-h` | Show help |
-| `--version`, `-v` | Show the version |
+| `--version`, `-V` | Show the version (`-v` is rejected, so it can't be mistaken for grep's invert: use `NOT`) |
 | `--` | Treat all following arguments as query terms (for keys starting with `--`) |
 
 ### Conditions

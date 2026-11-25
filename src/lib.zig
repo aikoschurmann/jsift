@@ -103,6 +103,7 @@ fn errorMessage(err: anyerror, file_path: ?[*:0]const u8) []const u8 {
         error.InvalidFormat => "--format must be json, csv or tsv",
         error.InvalidCondition => "incomplete condition, expected <key> <op> <val>",
         error.UnknownOperator => "unknown operator (eq, neq, gt, lt, gte, lte, has, exists, in)",
+        error.InvertOption => "-v isn't an option: negate a condition with NOT",
         error.UnknownOption => "unknown option (put -- before query terms that start with --)",
         error.MissingArguments => "no query given, expected a condition or SELECT",
         error.TooManyPluckFields => "too many SELECT fields (max 256)",

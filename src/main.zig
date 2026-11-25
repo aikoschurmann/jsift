@@ -24,6 +24,7 @@ pub fn main(init: std.process.Init) u8 {
             error.MissingFormatValue => "jsift: --format needs json, csv or tsv",
             error.InvalidCondition => "jsift: incomplete condition, expected <key> <op> <val>",
             error.UnknownOperator => "jsift: unknown operator (eq, neq, gt, lt, gte, lte, has, exists, in)",
+            error.InvertOption => "jsift: -v isn't an option: negate a condition with NOT (and use -V for the version)",
             error.UnknownOption => "jsift: unknown option (put -- before query terms that start with --)",
             error.MissingArguments => "jsift: no query given, expected a condition or SELECT",
             error.TooManyPluckFields => "jsift: too many SELECT fields (max 256)",

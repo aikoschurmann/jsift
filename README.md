@@ -186,10 +186,11 @@ Files are the terms left over once the query is complete, so `SELECT` fields and
 | `--count`, `-c` | Print only the number of matching lines |
 | `--header` | Print a header row of field names (TSV/CSV) |
 | `--limit <n>` | Stop after `n` matches |
+| `--invert`, `-v` | Select the lines that don't match, like `grep -v`: the same as `NOT ( … )` around the whole condition. Lines that aren't valid JSON are still skipped |
 | `--line-number`, `-n` | Prefix each match with its line number in its file (`12:{...}`). With `SELECT` it is a first column named `line`, or a `"line"` member in JSON. Ignored by `--count` and aggregates |
 | `--fast` | Match on the raw bytes only, without the exact parse: faster, but approximate (see [Limitations](#limitations--trade-offs)) |
 | `--help`, `-h` | Show help |
-| `--version`, `-V` | Show the version (`-v` is rejected, so it can't be mistaken for grep's invert: use `NOT`) |
+| `--version`, `-V` | Show the version |
 | `--` | Treat all following arguments as query terms (for keys starting with `--`) |
 
 ### Conditions
@@ -468,11 +469,11 @@ jsift.run("SELECT name,age", file="people.jsonl", format="csv", header=True).out
 
 | Function | Returns |
 |---|---|
-| `search(query, *, file=, data=, limit=, fast=)` | Matching lines (or SELECT rows) parsed as JSON: `list[dict]` |
+| `search(query, *, file=, data=, limit=, fast=, invert=)` | Matching lines (or SELECT rows) parsed as JSON: `list[dict]` |
 | `select(...)` | Same as `search`, with `SELECT` added to the front if missing |
 | `search_lines(...)` | Matching lines as `list[bytes]`, not parsed |
-| `count(query="", *, file=, data=, fast=)` | Number of matching lines: `int` |
-| `run(query, *, file=, data=, limit=, fast=, format=, count_only=, header=)` | `Result(output: bytes, matched: int)`: the CLI's exact output |
+| `count(query="", *, file=, data=, fast=, invert=)` | Number of matching lines: `int` |
+| `run(query, *, file=, data=, limit=, fast=, invert=, format=, count_only=, header=)` | `Result(output: bytes, matched: int)`: the CLI's exact output |
 
 A query is a string, split the way a shell splits a command line, or a list of tokens such as `["level", "eq", "error"]`. Pass exactly one of `file=` (a path) or `data=`. An invalid query, or a file that can't be read, raises `jsift.JsiftError`.
 

@@ -33,6 +33,8 @@ pub const Config = struct {
     header: bool = false,
     /// Prefix each output line with its line number in its file.
     line_numbers: bool = false,
+    /// Select the lines that don't match the WHERE clause, as `NOT (...)` would.
+    invert: bool = false,
     /// Evaluate on the raw bytes only, without the exact parse.
     fast: bool = false,
     /// Rule lines out with the byte-level search before parsing. Only turned off by tests.
@@ -57,6 +59,7 @@ pub fn printUsage() void {
         \\  --count, -c         Print only the count of matching lines
         \\  --header            Print column header row (for TSV/CSV with SELECT)
         \\  --limit <n>         Stop after n matches
+        \\  --invert, -v        Print the lines that don't match (NOT around the whole query)
         \\  --line-number, -n   Prefix each match with its line number (a "line" column with SELECT)
         \\  --fast              Match on raw bytes only: faster, but approximate (keys at any depth,
         \\                      no escape decoding, no validation)
@@ -362,7 +365,7 @@ fn toGroups(allocator: std.mem.Allocator, expr: Expr, negated: bool) error{ OutO
 /// with parentheses. AND binds tighter than OR. The result is a list of OR'ed groups whose
 /// conditions are AND'ed, which is the form the search evaluates. Also returns the tokens
 /// left after the clause, which can only be files.
-fn parseWhereClause(allocator: std.mem.Allocator, tokens: []const []const u8) !struct { []ConditionGroup, []const []const u8 } {
+fn parseWhereClause(allocator: std.mem.Allocator, tokens: []const []const u8, invert: bool) !struct { []ConditionGroup, []const []const u8 } {
     if (tokens.len == 0) return .{ &.{}, &.{} };
     var stream: TokenStream = .{ .tokens = tokens };
     const expr = try parseOr(allocator, &stream);
@@ -370,7 +373,7 @@ fn parseWhereClause(allocator: std.mem.Allocator, tokens: []const []const u8) !s
         if (std.mem.eql(u8, token, ")")) return error.UnbalancedParentheses;
     }
 
-    const flat = try toGroups(allocator, expr, false);
+    const flat = try toGroups(allocator, expr, invert);
     const groups = try allocator.alloc(ConditionGroup, flat.len);
     for (flat, groups) |conditions, *group| group.* = .{ .conditions = try allocator.dupe(Condition, conditions) };
     return .{ groups, tokens[stream.index..] };
@@ -409,10 +412,8 @@ pub fn parseArgs(allocator: std.mem.Allocator, args: []const []const u8) !Comman
             return .help;
         } else if (std.mem.eql(u8, arg, "--version") or std.mem.eql(u8, arg, "-V")) {
             return .version;
-        } else if (std.mem.eql(u8, arg, "-v")) {
-            // grep's -v inverts the match. Rejected rather than read as a key, so it can't
-            // silently do something else.
-            return error.InvertOption;
+        } else if (std.mem.eql(u8, arg, "--invert") or std.mem.eql(u8, arg, "-v")) {
+            config.invert = true;
         } else if (std.mem.eql(u8, arg, "--count") or std.mem.eql(u8, arg, "-c")) {
             config.count_only = true;
         } else if (std.mem.eql(u8, arg, "--line-number") or std.mem.eql(u8, arg, "-n")) {
@@ -462,7 +463,9 @@ pub fn parseArgs(allocator: std.mem.Allocator, args: []const []const u8) !Comman
 
     // Without WHERE, a SELECT has no conditions and anything after its fields is a file.
     var rest: []const []const u8 = query_tokens[next_token..];
-    if (has_where) config.groups, rest = try parseWhereClause(allocator, rest);
+    if (has_where) config.groups, rest = try parseWhereClause(allocator, rest, config.invert);
+    // Inverting no conditions, which match every line, would match none.
+    if (config.invert and config.groups.len == 0) return error.InvertWithoutCondition;
     if (group_files) |after_group| {
         // Files go after GROUP BY, so nothing may be left before it.
         if (rest.len > 0) return error.InvalidCondition;
@@ -506,7 +509,12 @@ test "parseArgs flags and errors" {
     try std.testing.expectError(error.SelectNeedsCommas, parseArgs(allocator, &.{ "SELECT", "a", "b", "WHERE", "a", "exists" }));
     // Files must come after GROUP BY.
     try std.testing.expectError(error.InvalidCondition, parseArgs(allocator, &.{ "SELECT", "count:a", "WHERE", "a", "exists", "x.jsonl", "GROUP", "BY", "a" }));
-    try std.testing.expectError(error.InvertOption, parseArgs(allocator, &.{ "-v", "a", "exists" }));
+    // -v negates the whole clause.
+    const inverted = (try parseArgs(allocator, &.{ "-v", "a", "exists", "OR", "NOT", "b", "exists" })).run;
+    try std.testing.expectEqual(@as(usize, 1), inverted.groups.len);
+    try std.testing.expect(inverted.groups[0].conditions[0].negated);
+    try std.testing.expect(!inverted.groups[0].conditions[1].negated);
+    try std.testing.expectError(error.InvertWithoutCondition, parseArgs(allocator, &.{ "--invert", "SELECT", "a" }));
 
     // `--` lets query terms start with dashes; negative numbers never needed it.
     const dashed = (try parseArgs(allocator, &.{ "--", "--weird", "eq", "--x" })).run;

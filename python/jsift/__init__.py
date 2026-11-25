@@ -59,6 +59,7 @@ def run(
     data: Data | None = None,
     limit: int | None = None,
     fast: bool = False,
+    invert: bool = False,
     format: str | None = None,
     count_only: bool = False,
     header: bool = False,
@@ -80,6 +81,8 @@ def run(
         args = ["--format", format, *args]
     if fast:
         args = ["--fast", *args]
+    if invert:
+        args = ["--invert", *args]
     if count_only:
         args = ["--count", *args]
     if header:
@@ -121,9 +124,10 @@ def search_lines(
     data: Data | None = None,
     limit: int | None = None,
     fast: bool = False,
+    invert: bool = False,
 ) -> list[bytes]:
     """Returns the matching lines as raw bytes, without parsing them."""
-    return run(query, file=file, data=data, limit=limit, fast=fast).lines()
+    return run(query, file=file, data=data, limit=limit, fast=fast, invert=invert).lines()
 
 
 def search(
@@ -133,13 +137,14 @@ def search(
     data: Data | None = None,
     limit: int | None = None,
     fast: bool = False,
+    invert: bool = False,
 ) -> list[Any]:
     """Returns the matching lines parsed as JSON.
 
     For a ``SELECT`` query, each item is a dict of the selected fields; with aggregations
     the list holds a single dict.
     """
-    result = run(query, file=file, data=data, limit=limit, fast=fast, format="json")
+    result = run(query, file=file, data=data, limit=limit, fast=fast, invert=invert, format="json")
     return [json.loads(line) for line in result.lines()]
 
 
@@ -150,12 +155,13 @@ def select(
     data: Data | None = None,
     limit: int | None = None,
     fast: bool = False,
+    invert: bool = False,
 ) -> list[dict[str, Any]]:
     """Alias of :func:`search` for ``SELECT`` queries; ``SELECT`` is prepended if missing."""
     tokens = _tokens(query)
     if not tokens or tokens[0].lower() != "select":
         tokens = ["SELECT", *tokens]
-    return search(tokens, file=file, data=data, limit=limit, fast=fast)
+    return search(tokens, file=file, data=data, limit=limit, fast=fast, invert=invert)
 
 
 def count(
@@ -164,6 +170,7 @@ def count(
     file: PathLike | None = None,
     data: Data | None = None,
     fast: bool = False,
+    invert: bool = False,
 ) -> int:
     """Returns the number of matching lines (all lines when the query is empty)."""
-    return run(query, file=file, data=data, fast=fast, count_only=True).matched
+    return run(query, file=file, data=data, fast=fast, invert=invert, count_only=True).matched

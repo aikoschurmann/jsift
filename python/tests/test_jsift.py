@@ -130,3 +130,8 @@ def test_group_by():
         {"level": "error", "count:name": 2, "max:age": 31},
         {"level": "info", "count:name": 1, "max:age": 40},
     ]
+
+
+def test_invert():
+    assert jsift.count("level eq error", data=DATA, invert=True) == 1
+    assert [row["name"] for row in jsift.search("level eq error", data=DATA, invert=True)] == ["Bob"]

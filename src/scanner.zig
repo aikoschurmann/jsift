@@ -853,6 +853,15 @@ test "line numbers" {
     try testing.expect(std.mem.endsWith(u8, out, try std.fmt.allocPrint(a, "{d}\t{d}\n", .{ line_count, 1_000_000_000 + line_count - 1 })));
 }
 
+test "invert" {
+    try expectQuery(demo, &.{ "-v", "SELECT", "name", "WHERE", "age", "eq", "30", "OR", "tier", "eq", "5" }, "Alice\nDave\n");
+    try expectQuery(demo, &.{ "--invert", "SELECT", "name", "WHERE", "active", "eq", "b:true", "AND", "tier", "gt", "1" }, "Alice\nBob\nEve\n");
+    // Same as NOT (...). Invalid lines are skipped either way, and a missing key fails the
+    // condition, so its line is printed.
+    try expectQuery("{\"a\":1}\nnot json\n{\"b\":2}\n{\"a\":2}\n", &.{ "-v", "a", "eq", "1" }, "{\"b\":2}\n{\"a\":2}\n");
+    try expectQuery(demo, &.{ "-v", "-c", "NOT", "tier", "gte", "3" }, "3\n");
+}
+
 test "parentheses group conditions" {
     try expectQuery(demo, &.{ "SELECT", "name", "WHERE", "(tier", "eq", "1", "OR", "tier", "eq", "5)", "AND", "active", "eq", "b:true" }, "Alice\n");
     try expectQuery(demo, &.{ "SELECT", "name", "WHERE", "NOT", "(", "age", "eq", "30", "OR", "tier", "eq", "5", ")" }, "Alice\nDave\n");

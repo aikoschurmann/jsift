@@ -363,9 +363,13 @@ const Block = struct {
 /// Fills `buf` with `carry` followed by fresh input, up to the last complete line, growing
 /// `buf` when it is too small (an empty `buf` is allocated here). On return, `carry` is the
 /// partial last line. It sits in `buf` past the block's `len`, which no scan reads, so it
-/// stays valid until the next call copies it into the next buffer. That buffer must be a
-/// different one: `buf` is the only one this call resizes.
+/// stays valid until the next call copies it to the front of the next buffer. The next
+/// buffer may be `buf` again, once its block is no longer needed.
 fn readBlock(target: ReadTarget, buf: *[]u8, carry: *[]const u8) Block {
+    // A carry in `buf` itself is moved to the front first, since growing may move `buf`.
+    const carry_in_buf = carry.len > 0 and @intFromPtr(carry.ptr) >= @intFromPtr(buf.ptr) and
+        @intFromPtr(carry.ptr) < @intFromPtr(buf.ptr) + buf.len;
+    if (carry_in_buf) std.mem.copyForwards(u8, buf.*[0..carry.len], carry.*);
     // Make room for the carry plus at least half a block of fresh data. Growing
     // only when this fails keeps the common path free of reallocations.
     if (carry.len + target.block_size / 2 > buf.len or buf.len == 0) {
@@ -373,7 +377,7 @@ fn readBlock(target: ReadTarget, buf: *[]u8, carry: *[]const u8) Block {
         // for a block that will never come.
         growBuffer(buf, carry.len + @max(target.block_size, 1)) catch |err| return .{ .len = 0, .eof = true, .read_err = err };
     }
-    @memcpy(buf.*[0..carry.len], carry.*);
+    if (!carry_in_buf) @memcpy(buf.*[0..carry.len], carry.*);
     var total = carry.len;
     // The carried bytes contain no newline, so the newline search can start after them.
     var scanned = carry.len;
@@ -546,9 +550,9 @@ const FeedSource = union(enum) {
 
 /// The feeder's half of a slot: one chunk of input.
 const Chunk = struct {
-    /// Buffer the feeder reads into. Kept across uses of the slot, and grown as needed.
-    buf: []u8 = &.{},
-    /// The newline-aligned bytes to scan: a prefix of `buf`, or a slice of in-memory input.
+    /// Index of the buffer, in `Feed.buffers`, that the chunk was read into.
+    buffer: usize = 0,
+    /// The newline-aligned bytes to scan: in the buffer, or a slice of in-memory input.
     input: []const u8 = &.{},
     /// Lines in the same file before `input`, for --line-number.
     first_line: usize = 0,
@@ -602,6 +606,15 @@ const Feed = struct {
     refs: std.atomic.Value(u32) = .init(2),
     /// Holds the copy of the file paths: a detached feeder may outlive the caller's list.
     arena: std.heap.ArenaAllocator = .init(page_allocator),
+    /// One read buffer per slot, allocated on first use and grown as needed. They are
+    /// handed out separately from the slots, most recently freed first: when one thread
+    /// keeps up with the input, the same one or two buffers, still in the cache from the
+    /// last scan, are refilled, as in the single-threaded reader. Handing them out in
+    /// slot order would cycle through all of them, and measured 5% slower on a pipe.
+    buffers: [][]u8,
+    /// Free buffers, the most recently freed last. Guarded by `queue.mutex`.
+    free_buffers: []usize,
+    free_buffer_count: usize,
     /// Owned by the calling thread. The feeder only starts them, under `queue.mutex` and
     /// before `stop`, so the calling thread knows which ones to join.
     workers: []Worker,
@@ -615,6 +628,13 @@ const Feed = struct {
         const chunks = try page_allocator.alloc(Chunk, slot_count);
         errdefer page_allocator.free(chunks);
         @memset(chunks, .{});
+        const buffers = try page_allocator.alloc([]u8, slot_count);
+        errdefer page_allocator.free(buffers);
+        @memset(buffers, &.{});
+        const free_buffers = try page_allocator.alloc(usize, slot_count);
+        errdefer page_allocator.free(free_buffers);
+        // Buffer 0 is handed out first.
+        for (free_buffers, 0..) |*buffer, index| buffer.* = slot_count - 1 - index;
         feed.* = .{
             .io = io,
             .source = source,
@@ -622,6 +642,9 @@ const Feed = struct {
             .stream_block_size = config.stream_block_size,
             .count_lines = false,
             .chunks = chunks,
+            .buffers = buffers,
+            .free_buffers = free_buffers,
+            .free_buffer_count = slot_count,
             .free = .{ .permits = slot_count },
             .workers = workers,
             .results = results,
@@ -638,17 +661,37 @@ const Feed = struct {
     /// Drops one reference, and frees everything when it was the last.
     fn release(feed: *Feed) void {
         if (feed.refs.fetchSub(1, .acq_rel) != 1) return;
-        for (feed.chunks) |chunk| page_allocator.free(chunk.buf);
+        for (feed.buffers) |buffer| page_allocator.free(buffer);
+        page_allocator.free(feed.buffers);
+        page_allocator.free(feed.free_buffers);
         page_allocator.free(feed.chunks);
         feed.arena.deinit();
         page_allocator.destroy(feed);
     }
 
-    /// Feeder: waits until the slot for chunk `seq` is free. Null once the scan is stopped.
+    /// Feeder: waits until the slot for chunk `seq` is free, and gives it a free buffer.
+    /// Null once the scan is stopped.
     fn acquire(feed: *Feed, seq: usize) ?*Chunk {
         feed.free.waitUncancelable(feed.io);
         if (feed.stop.load(.acquire)) return null;
-        return &feed.chunks[seq % feed.chunks.len];
+        const chunk = &feed.chunks[seq % feed.chunks.len];
+        feed.queue.mutex.lockUncancelable(feed.io);
+        defer feed.queue.mutex.unlock(feed.io);
+        // A free slot means a free buffer: every slot in use holds one.
+        feed.free_buffer_count -= 1;
+        chunk.* = .{ .buffer = feed.free_buffers[feed.free_buffer_count] };
+        return chunk;
+    }
+
+    /// Calling thread: hands chunk `seq`'s slot and buffer back to the feeder.
+    fn recycle(feed: *Feed, seq: usize) void {
+        {
+            feed.queue.mutex.lockUncancelable(feed.io);
+            defer feed.queue.mutex.unlock(feed.io);
+            feed.free_buffers[feed.free_buffer_count] = feed.chunks[seq % feed.chunks.len].buffer;
+            feed.free_buffer_count += 1;
+        }
+        feed.free.post(feed.io);
     }
 
     /// Feeder: hands chunk `seq.*` over and moves on to the next.
@@ -757,7 +800,9 @@ fn feederThread(feed: *Feed) void {
             const file = std.Io.Dir.cwd().openFile(feed.io, path, .{}) catch |err| {
                 // The error ends the input. It is reported once the earlier files are written out.
                 const chunk = feed.acquire(seq) orelse return;
-                chunk.* = .{ .buf = chunk.buf, .last = true, .read_err = err, .file_index = index };
+                chunk.last = true;
+                chunk.read_err = err;
+                chunk.file_index = index;
                 feed.publish(&seq);
                 return;
             };
@@ -777,7 +822,9 @@ fn feedBytes(feed: *Feed, data: []const u8, seq: *usize) void {
         // Extend the chunk to the end of the line its last byte is in.
         if (end < data.len) end = if (std.mem.findScalarPos(u8, data, end - 1, '\n')) |newline| newline + 1 else data.len;
         const last = end == data.len;
-        chunk.* = .{ .buf = chunk.buf, .input = data[start..end], .first_line = lines, .last = last };
+        chunk.input = data[start..end];
+        chunk.first_line = lines;
+        chunk.last = last;
         if (feed.count_lines) lines += std.mem.countScalar(u8, chunk.input, '\n');
         feed.publish(seq);
         if (last) return;
@@ -789,16 +836,16 @@ fn feedBytes(feed: *Feed, data: []const u8, seq: *usize) void {
 /// when the input ended or the scan was stopped.
 fn feedFile(feed: *Feed, file: std.Io.File, file_index: ?usize, last_file: bool, seq: *usize) bool {
     const target: ReadTarget = .init(file, feed.block_size, feed.stream_block_size, feed.io);
-    // Partial last line of the previous chunk (see `readBlock`). There are two slots at
-    // least, so the previous chunk's buffer is never the one being filled.
+    // Partial last line of the previous chunk (see `readBlock`).
     var carry: []const u8 = &.{};
     // Line numbers restart in every file, as in grep.
     var lines: usize = 0;
     while (true) {
         const chunk = feed.acquire(seq.*) orelse return false;
-        const block = readBlock(target, &chunk.buf, &carry);
+        const buffer = &feed.buffers[chunk.buffer];
+        const block = readBlock(target, buffer, &carry);
         const last = block.eof and (last_file or block.read_err != null);
-        chunk.input = chunk.buf[0..block.len];
+        chunk.input = buffer.*[0..block.len];
         chunk.first_line = lines;
         chunk.last = last;
         chunk.read_err = block.read_err;
@@ -1038,8 +1085,7 @@ fn writeInOrder(search: *Search, helper: *Worker, failed_file: ?FailedFile) !voi
             return err;
         }
         if (chunk.last) return;
-        // Hand the slot back to the feeder.
-        feed.free.post(feed.io);
+        feed.recycle(seq);
     }
 }
 

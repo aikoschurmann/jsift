@@ -1,14 +1,21 @@
 # jsift
-*A blisteringly fast JSONL search engine.*
+*A blisteringly fast JSONL search engine, for the command line and Python.*
+
+[![PyPI](https://img.shields.io/pypi/v/jsift)](https://pypi.org/project/jsift/)
+[![Python](https://img.shields.io/pypi/pyversions/jsift)](https://pypi.org/project/jsift/)
+[![Release](https://img.shields.io/github/v/release/aikoschurmann/jsift)](https://github.com/aikoschurmann/jsift/releases/latest)
+[![License: MIT](https://img.shields.io/github/license/aikoschurmann/jsift)](LICENSE)
 
 ![jsift and jq counting the error lines in a 462 MB log file: jq takes 9.3 s, jsift 0.14 s](assets/demo.gif)
 
 *The same query on 2 million log lines (462 MB): `jq` takes 9.3 s (cut in gif for brevity), jsift 0.14 s, with the same count. Recorded on an Apple M2 Pro.*
 
 ```bash
-# macOS (Apple Silicon)
+# Python (macOS and Linux, Python 3.9+)
+pip install jsift
+# CLI, macOS (Apple Silicon)
 curl -fL https://github.com/aikoschurmann/jsift/releases/latest/download/jsift-macos-arm64 -o jsift && chmod +x jsift && sudo mv jsift /usr/local/bin/
-# Linux (x86_64)
+# CLI, Linux (x86_64)
 curl -fL https://github.com/aikoschurmann/jsift/releases/latest/download/jsift-linux-amd64 -o jsift && chmod +x jsift && sudo mv jsift /usr/local/bin/
 ```
 
@@ -22,6 +29,16 @@ curl -fL https://github.com/aikoschurmann/jsift/releases/latest/download/jsift-l
 jsift --file app.jsonl level eq error AND status gte 500
 jsift --file app.jsonl SELECT service,count:bytes,avg:latency_ms WHERE status eq 200
 tail -f app.jsonl | jsift level eq error
+```
+
+The same engine runs inside Python. It doesn't start a subprocess, and the GIL is released while it searches ([details](#python)):
+
+```python
+import jsift
+
+jsift.search("level eq error AND status gte 500", file="app.jsonl")  # -> list of dicts
+jsift.count("level eq error", file="app.jsonl")                      # -> 333202
+jsift.select("service,avg:latency_ms WHERE status eq 200", file="app.jsonl")
 ```
 
 ---
@@ -308,11 +325,71 @@ if jsift --file logs.jsonl --count level eq error > /dev/null; then echo "errors
 
 ---
 
+## Python
+
+```bash
+pip install jsift
+```
+
+The Python package bundles jsift as a native library and calls it directly. It doesn't start a subprocess or need a binary on your `PATH`. Queries use the same language as the CLI. The search runs with the GIL released, so other Python threads keep going, and several searches can run in parallel.
+
+```python
+import jsift
+
+# Matching lines, parsed into dicts
+jsift.search("level eq error AND status gte 500", file="app.jsonl")
+
+# Count matches without building any objects
+jsift.count("level eq error", file="app.jsonl")
+
+# Pull out fields (SELECT is optional here) or aggregate
+jsift.select("service,latency_ms WHERE status eq 200", file="app.jsonl")
+# -> [{"service": "storage", "latency_ms": 229.562}, ...]
+jsift.search("SELECT count:bytes,avg:latency_ms WHERE service eq auth", file="app.jsonl")
+# -> [{"count:bytes": 400825, "avg:latency_ms": 449.8548}]
+
+# JSONL already in memory: bytes or str
+jsift.search("user.id in 1,2,3", data=response.content)
+
+# Matching lines as raw bytes, without parsing them (fastest)
+jsift.search_lines("level eq error", file="app.jsonl", limit=100)
+
+# Byte-level matching only: faster, approximate (same as --fast)
+jsift.count("level eq error", file="app.jsonl", fast=True)
+
+# Exactly the CLI's output, in any format
+jsift.run("SELECT name,age", file="people.jsonl", format="csv", header=True).output
+```
+
+| Function | Returns |
+|---|---|
+| `search(query, *, file=, data=, limit=, fast=)` | Matching lines (or SELECT rows) parsed as JSON: `list[dict]` |
+| `select(...)` | Same as `search`, with `SELECT` added to the front if missing |
+| `search_lines(...)` | Matching lines as `list[bytes]`, not parsed |
+| `count(query="", *, file=, data=, fast=)` | Number of matching lines: `int` |
+| `run(query, *, file=, data=, limit=, fast=, format=, count_only=, header=)` | `Result(output: bytes, matched: int)`: the CLI's exact output |
+
+A query is a string, split the way a shell splits a command line, or a list of tokens such as `["level", "eq", "error"]`. Pass exactly one of `file=` (a path) or `data=`. An invalid query, or a file that can't be read, raises `jsift.JsiftError`.
+
+Wheels are available for macOS (arm64, x86_64) and Linux (x86_64 and aarch64; glibc and musl/Alpine). One wheel per platform covers every Python version from 3.9 up. On other platforms pip builds from source, which needs [Zig](https://ziglang.org/download/) 0.16.0.
+
+---
+
 ## Installation
 
-jsift is a single static binary with no dependencies.
+### Python
 
-### Prebuilt binaries
+```bash
+pip install jsift
+```
+
+See [Python](#python) for the API.
+
+### Command line
+
+The CLI is a single static binary with no dependencies.
+
+#### Prebuilt binaries
 
 Download the latest binary for your platform from the [Releases](https://github.com/aikoschurmann/jsift/releases) page.
 
@@ -328,7 +405,7 @@ chmod +x jsift && sudo mv jsift /usr/local/bin/
 
 The Linux binary targets baseline x86_64 so that it runs on any 64-bit CPU. That means 16-byte SSE2 vectors and no byte shuffle, which leaves out the [Teddy](#4-many-key-ors-teddy) path for many-key `OR`s. For full speed, build from source with `-Dcpu=native`.
 
-### Build from source
+#### Build from source
 
 Requires [Zig](https://ziglang.org/download/) 0.16.0.
 
@@ -339,7 +416,7 @@ zig build -Doptimize=ReleaseFast              # add -Dcpu=native for your CPU's 
 zig build test                                # run the test suite
 ```
 
-The binary ends up at `./zig-out/bin/jsift`.
+The binary ends up at `./zig-out/bin/jsift`. To build and install the Python package from the checkout instead, run `pip install .` (it calls `zig build lib`), and `pytest python/tests` to test it.
 
 ---
 

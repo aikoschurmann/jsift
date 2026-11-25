@@ -486,6 +486,7 @@ test {
     _ = json;
     _ = finder;
     _ = values;
+    _ = compile;
 }
 
 /// Runs a query on `input`, returning its output (allocated in `a`).
@@ -648,6 +649,13 @@ test "aggregates print exact, shortest numbers" {
     try expectQuery("{\"b\":2.0}\n{\"b\":-0.0}\n", &.{ "SELECT", "sum:b,min:b" }, "2\t0\n");
     try expectQuery("{\"b\":1e300}\n{\"b\":1e-9}\n", &.{ "SELECT", "max:b,min:b" }, "1e300\t1e-9\n");
     try expectQuery("{\"b\":1e400}\n{\"b\":1}\n", &.{ "SELECT", "sum:b" }, "inf\n");
+}
+
+test "in values can contain escaped commas" {
+    const input = "{\"a\":\"x,y\"}\n{\"a\":\"x\"}\n{\"a\":\"z\"}\n";
+    try expectQuery(input, &.{ "a", "in", "x\\,y,z" }, "{\"a\":\"x,y\"}\n{\"a\":\"z\"}\n");
+    try expectQuery(input, &.{ "--fast", "a", "in", "x\\,y,z" }, "{\"a\":\"x,y\"}\n{\"a\":\"z\"}\n");
+    try expectQuery(input, &.{ "a", "in", "x,y" }, "{\"a\":\"x\"}\n");
 }
 
 test "limit 0 outputs nothing" {

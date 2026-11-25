@@ -192,7 +192,7 @@ A condition is `<key> <op> <value>`, or `<key> exists`.
 | `eq` / `neq` | equals / doesn't equal the value (numbers compare by value: `eq 90` matches `90.0` and `9e1`) |
 | `gt`, `gte`, `lt`, `lte` | compares numerically (the value must be a number) |
 | `has` | contains the value as a substring (strings, and the text of numbers and literals; never objects or arrays) |
-| `in` | equals one of a comma-separated list: `level in error,warn` |
+| `in` | equals one of a comma-separated list: `level in error,warn` (write `\,` for a comma inside a value, `\\` for a backslash) |
 | `exists` | the key is present, whatever its value |
 
 Keys name members of the top-level object. Use dots to reach into nested objects, and `\.` for a dot that is part of a key:

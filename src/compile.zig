@@ -95,6 +95,40 @@ fn splitPath(allocator: std.mem.Allocator, key: []const u8) ![]const []const u8 
     return segments.toOwnedSlice(allocator);
 }
 
+/// Splits the value list of `in` at its commas. `\,` is a literal comma and `\\` a
+/// backslash, as in key paths; any other backslash is kept as it is.
+fn splitInList(allocator: std.mem.Allocator, list: []const u8) ![]const []const u8 {
+    var items: std.ArrayList([]const u8) = .empty;
+    var item: std.ArrayList(u8) = .empty;
+    var pos: usize = 0;
+
+    while (pos < list.len) : (pos += 1) {
+        const byte = list[pos];
+        if (byte == '\\' and pos + 1 < list.len and (list[pos + 1] == ',' or list[pos + 1] == '\\')) {
+            pos += 1;
+            try item.append(allocator, list[pos]);
+        } else if (byte == ',') {
+            try items.append(allocator, try item.toOwnedSlice(allocator));
+        } else {
+            try item.append(allocator, byte);
+        }
+    }
+    try items.append(allocator, try item.toOwnedSlice(allocator));
+    return items.toOwnedSlice(allocator);
+}
+
+test "splitInList" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const items = try splitInList(arena.allocator(), "a,x\\,y,,b\\\\,c\\d");
+    try std.testing.expectEqual(@as(usize, 5), items.len);
+    try std.testing.expectEqualStrings("a", items[0]);
+    try std.testing.expectEqualStrings("x,y", items[1]);
+    try std.testing.expectEqualStrings("", items[2]);
+    try std.testing.expectEqualStrings("b\\", items[3]);
+    try std.testing.expectEqualStrings("c\\d", items[4]);
+}
+
 fn compileLiteral(allocator: std.mem.Allocator, text: []const u8) !Literal {
     return .{
         .quoted = try jsonEscapeAlloc(allocator, text, true),
@@ -127,8 +161,7 @@ fn compileCondition(
     // `in` takes a comma-separated list. Empty items, as in `a,,b`, are ignored.
     var in_vals: std.ArrayList(Literal) = .empty;
     if (condition.op == .in_op) {
-        var items = std.mem.splitScalar(u8, raw_value, ',');
-        while (items.next()) |item| {
+        for (try splitInList(allocator, raw_value)) |item| {
             if (item.len > 0) try in_vals.append(allocator, try compileLiteral(allocator, item));
         }
     }

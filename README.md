@@ -1,37 +1,97 @@
-# jsift
-*A blisteringly fast JSONL search engine, for the command line and Python.*
+<div align="center">
 
-[![PyPI](https://img.shields.io/pypi/v/jsift)](https://pypi.org/project/jsift/)
-[![Python](https://img.shields.io/pypi/pyversions/jsift)](https://pypi.org/project/jsift/)
-[![Release](https://img.shields.io/github/v/release/aikoschurmann/jsift)](https://github.com/aikoschurmann/jsift/releases/latest)
-[![License: MIT](https://img.shields.io/github/license/aikoschurmann/jsift)](LICENSE)
+<h1>jsift</h1>
 
-![jsift and jq counting the error lines in a 462 MB log file: jq takes 9.3 s, jsift 0.14 s](assets/demo.gif)
+<p><b>Search gigabytes of JSONL at <code>grep</code> speed, with <code>jq</code>'s exact answers.</b><br>
+A SIMD query engine for line-delimited JSON, for the command line and Python.</p>
 
-*The same query on 2 million log lines (462 MB): `jq` takes 9.3 s (cut in gif for brevity), jsift 0.14 s, with the same count. Recorded on an Apple M2 Pro.*
+<p>
+<a href="https://pypi.org/project/jsift/"><img src="https://img.shields.io/pypi/v/jsift?color=2a78d6" alt="PyPI"></a>
+<a href="https://pypi.org/project/jsift/"><img src="https://img.shields.io/pypi/pyversions/jsift" alt="Python versions"></a>
+<a href="https://github.com/aikoschurmann/jsift/releases/latest"><img src="https://img.shields.io/github/v/release/aikoschurmann/jsift?label=binary" alt="Latest release"></a>
+<a href="LICENSE"><img src="https://img.shields.io/github/license/aikoschurmann/jsift" alt="MIT license"></a>
+</p>
+
+<p>
+<a href="#install">Install</a> ·
+<a href="#quick-start">Quick start</a> ·
+<a href="#python">Python</a> ·
+<a href="#benchmarks">Benchmarks</a> ·
+<a href="#how-it-works">How it works</a>
+</p>
+
+<img src="assets/demo.gif" alt="jsift and jq counting the error lines in a 462 MB log file: jq takes 9.3 s, jsift 0.14 s" width="100%">
+
+<sub>The same query on 2 million log lines (462 MB): <code>jq</code> takes 9.3 s (cut from the GIF), jsift 0.14 s, with the same count. Recorded on an Apple M2 Pro.</sub>
+
+</div>
+
+<br>
+
+<picture>
+  <source media="(prefers-color-scheme: dark)" srcset="assets/benchmark-dark.svg">
+  <img src="assets/benchmark-light.svg" alt="Counting level eq error in 968 MB of JSONL: jq 17.4 s, jaq 8.6 s, jsift 0.26 s, jsift --fast 0.10 s" width="100%">
+</picture>
+
+## Why jsift
+
+- **Fast.** A SIMD search over the raw bytes rules out every line that provably can't match, so most of the file is never parsed. 20–60x faster than `jq`/`jaq`, and up to 10 GB/s with `--fast`.
+- **Exact.** Lines that might match go through a validating JSON parser that decides exactly. Nested paths, escapes and numbers like `9e1` work as in `jq`.
+- **A query language you already know.** Filter with `eq`, `gt`, `has`, `in`, `AND`/`OR`/`NOT`, pull out fields with `SELECT`, and compute `count`/`sum`/`avg`/`min`/`max`.
+- **Python, too.** `pip install jsift` runs the same engine in-process, with the GIL released.
+- **Streams.** Works on `tail -f`, prints matches as they arrive, and exits like `grep`.
+- **No dependencies.** One static binary, or one wheel per platform.
+
+## Install
+
+**Python** (macOS and Linux, Python 3.9+)
 
 ```bash
-# Python (macOS and Linux, Python 3.9+)
 pip install jsift
-# CLI, macOS (Apple Silicon)
+```
+
+**Command line**
+
+```bash
+# macOS (Apple Silicon)
 curl -fL https://github.com/aikoschurmann/jsift/releases/latest/download/jsift-macos-arm64 -o jsift && chmod +x jsift && sudo mv jsift /usr/local/bin/
-# CLI, Linux (x86_64)
+
+# Linux (x86_64)
 curl -fL https://github.com/aikoschurmann/jsift/releases/latest/download/jsift-linux-amd64 -o jsift && chmod +x jsift && sudo mv jsift /usr/local/bin/
 ```
 
-| 968 MB of JSONL, `level eq error` | jq | jaq | jsift | jsift `--fast` |
-|---|--:|--:|--:|--:|
-| Time | 17.4 s | 8.6 s | **0.26 s** | **0.10 s** |
+<details>
+<summary><b>Build from source</b></summary>
 
-**jsift** queries line-delimited JSON with a small SQL-like language: filter lines, pull out fields, and compute aggregates. It works in two layers. A SIMD search over the raw bytes rules out every line that provably can't match, and a validating JSON parser then decides the rest exactly. You get `jq`'s exact answers at close to `grep` speed: 20–60x faster than `jq`/`jaq` with exact results, and with `--fast` (bytes only, approximate) 30–180x faster and ahead of `ripgrep` on every search below.
+<br>
+
+Requires [Zig](https://ziglang.org/download/) 0.16.0.
 
 ```bash
-jsift --file app.jsonl level eq error AND status gte 500
-jsift --file app.jsonl SELECT service,count:bytes,avg:latency_ms WHERE status eq 200
-tail -f app.jsonl | jsift level eq error
+git clone https://github.com/aikoschurmann/jsift.git
+cd jsift
+zig build -Doptimize=ReleaseFast              # add -Dcpu=native for your CPU's widest SIMD
+zig build test                                # run the test suite
 ```
 
-The same engine runs inside Python. It doesn't start a subprocess, and the GIL is released while it searches ([details](#python)):
+The binary ends up at `./zig-out/bin/jsift`. To build and install the Python package from the checkout instead, run `pip install .` (it calls `zig build lib`), and `pytest python/tests` to test it.
+
+The Linux binary targets baseline x86_64 so that it runs on any 64-bit CPU. That means 16-byte SSE2 vectors and no byte shuffle, which leaves out the [Teddy](#4-many-key-ors-teddy) path for many-key `OR`s. For full speed, build from source with `-Dcpu=native`.
+
+</details>
+
+## Quick start
+
+```bash
+# Filter: print matching lines
+jsift --file app.jsonl level eq error AND status gte 500
+
+# Extract fields and aggregate
+jsift --file app.jsonl SELECT service,count:bytes,avg:latency_ms WHERE status eq 200
+
+# Follow a live log
+tail -f app.jsonl | jsift level eq error
+```
 
 ```python
 import jsift
@@ -40,6 +100,8 @@ jsift.search("level eq error AND status gte 500", file="app.jsonl")  # -> list o
 jsift.count("level eq error", file="app.jsonl")                      # -> 333202
 jsift.select("service,avg:latency_ms WHERE status eq 200", file="app.jsonl")
 ```
+
+See [Usage](#usage) for the full query language and [Python](#python) for the API.
 
 ---
 
@@ -70,7 +132,10 @@ How to read this:
 - **ripgrep compares raw text**, so its patterns are approximations. The AND/OR regex (`"level":"error".*"status":500|…`) only works because the keys always appear in the same order, and ripgrep can't parse numbers (`status gte 500` became `"status":5[0-9][0-9]`). jsift's queries understand JSON values and don't depend on key order.
 - ripgrep can't extract fields or aggregate, hence the dashes.
 
-### Real-world data: GitHub Archive, 3.1 GB
+<details>
+<summary><b>Real-world data: GitHub Archive, 3.1 GB</b></summary>
+
+<br>
 
 These were measured with jsift 1.0.0, so they correspond to `--fast`. In exact mode, keys inside nested objects need their path: `login eq torvalds` becomes `actor.login eq torvalds`.
 
@@ -91,6 +156,8 @@ Three hours of [GH Archive](https://www.gharchive.org/) events: 791,615 deeply n
 | `SELECT count:size,sum:size,avg:size WHERE type eq PushEvent` | 0.30 s |
 
 Most queries run at about 10 GB/s, on par with ripgrep's plain fixed-string count. An `OR` over many different keys costs little extra: 8 keys take 0.50 s, where testing each key separately would take over a second (see [Many-key ORs](#4-many-key-ors-teddy)).
+
+</details>
 
 ---
 
@@ -319,17 +386,13 @@ if jsift --file logs.jsonl --count level eq error > /dev/null; then echo "errors
 
 | Exit code | Meaning |
 |-----------|---------|
-| `0` | At least one line matched (also when the reader closes early, e.g. `| head`) |
+| `0` | At least one line matched (also when the reader closes early, e.g. <code>&#124; head</code>) |
 | `1` | No lines matched |
 | `2` | Error: bad arguments, unreadable input, a non-numeric value for `gt`/`lt`/…, or a failed write |
 
 ---
 
 ## Python
-
-```bash
-pip install jsift
-```
 
 The Python package bundles jsift as a native library and calls it directly. It doesn't start a subprocess or need a binary on your `PATH`. Queries use the same language as the CLI. The search runs with the GIL released, so other Python threads keep going, and several searches can run in parallel.
 
@@ -372,51 +435,6 @@ jsift.run("SELECT name,age", file="people.jsonl", format="csv", header=True).out
 A query is a string, split the way a shell splits a command line, or a list of tokens such as `["level", "eq", "error"]`. Pass exactly one of `file=` (a path) or `data=`. An invalid query, or a file that can't be read, raises `jsift.JsiftError`.
 
 Wheels are available for macOS (arm64, x86_64) and Linux (x86_64 and aarch64; glibc and musl/Alpine). One wheel per platform covers every Python version from 3.9 up. On other platforms pip builds from source, which needs [Zig](https://ziglang.org/download/) 0.16.0.
-
----
-
-## Installation
-
-### Python
-
-```bash
-pip install jsift
-```
-
-See [Python](#python) for the API.
-
-### Command line
-
-The CLI is a single static binary with no dependencies.
-
-#### Prebuilt binaries
-
-Download the latest binary for your platform from the [Releases](https://github.com/aikoschurmann/jsift/releases) page.
-
-```bash
-# macOS (Apple Silicon)
-curl -L https://github.com/aikoschurmann/jsift/releases/latest/download/jsift-macos-arm64 -o jsift
-chmod +x jsift && sudo mv jsift /usr/local/bin/
-
-# Linux (x86_64)
-curl -L https://github.com/aikoschurmann/jsift/releases/latest/download/jsift-linux-amd64 -o jsift
-chmod +x jsift && sudo mv jsift /usr/local/bin/
-```
-
-The Linux binary targets baseline x86_64 so that it runs on any 64-bit CPU. That means 16-byte SSE2 vectors and no byte shuffle, which leaves out the [Teddy](#4-many-key-ors-teddy) path for many-key `OR`s. For full speed, build from source with `-Dcpu=native`.
-
-#### Build from source
-
-Requires [Zig](https://ziglang.org/download/) 0.16.0.
-
-```bash
-git clone https://github.com/aikoschurmann/jsift.git
-cd jsift
-zig build -Doptimize=ReleaseFast              # add -Dcpu=native for your CPU's widest SIMD
-zig build test                                # run the test suite
-```
-
-The binary ends up at `./zig-out/bin/jsift`. To build and install the Python package from the checkout instead, run `pip install .` (it calls `zig build lib`), and `pytest python/tests` to test it.
 
 ---
 
@@ -509,6 +527,11 @@ Strings are compared after decoding. An unpaired `\ud800`-style escape decodes t
 
 ## Reproducing the benchmarks
 
+<details>
+<summary>Data generator and commands</summary>
+
+<br>
+
 Generate the synthetic file:
 
 ```python
@@ -546,6 +569,8 @@ jaq -c 'select(.level=="error")' logs.jsonl | wc -l
 
 Match queries are timed with `-c` on both jsift and ripgrep, because ripgrep stops after the first match when its output is `/dev/null`. Extraction and aggregation queries write their full output to a file.
 
+</details>
+
 ---
 
 ## Use cases
@@ -564,3 +589,9 @@ Match queries are timed with `-c` on both jsift and ripgrep, because ripgrep sto
 ## Contributing
 
 Contributions are welcome! Open an issue or a pull request on [GitHub](https://github.com/aikoschurmann/jsift).
+
+---
+
+<div align="center">
+<sub>MIT licensed · If jsift saved you some time, a ⭐ helps others find it.</sub>
+</div>

@@ -1,7 +1,7 @@
-<svg xmlns="http://www.w3.org/2000/svg" width="760" height="212" viewBox="0 0 760 212" role="img" aria-label="Time to count level eq error in 968 MB of JSONL: jq 17.4 s, jaq 8.6 s, jsift 0.26 s, jsift --fast 0.10 s">
+<svg xmlns="http://www.w3.org/2000/svg" width="760" height="212" viewBox="0 0 760 212" role="img" aria-label="Time to count level eq error in 968 MB of JSONL: jq 17.4 s, jaq 8.6 s, jsift 0.08 s, jsift --fast 0.07 s">
 <style>text{font-family:system-ui,-apple-system,"Segoe UI",Helvetica,Arial,sans-serif;fill:#0b0b0b}.t{font-size:17px;font-weight:600}.s{font-size:13px;fill:#52514e}.l{font-size:14px;font-weight:500}.v{font-size:14px;fill:#52514e}.w{fill:#0b0b0b;font-weight:600}.n{fill:#52514e;font-weight:400}.m{font-family:ui-monospace,SFMono-Regular,Menlo,monospace}</style>
 <text class="t" x="0" y="22">Counting <tspan class="m">level eq error</tspan> in 968 MB of JSONL</text>
-<text class="s" x="0" y="43">4 million log lines, file in page cache, Apple M2 Pro. Lower is better.</text>
+<text class="s" x="0" y="43">4 million log lines, file in page cache, Apple M2 Pro, jsift on 8 threads. Lower is better.</text>
 <text class="l" x="108" y="78.0" text-anchor="end">jq</text>
 <path fill="#c3c2b7" d="M120,62 H586.0 Q590.0,62 590.0,66 V80 Q590.0,84 586.0,84 H120 Z"/>
 <text class="v" x="600.0" y="78.0">17.4 s</text>
@@ -9,10 +9,10 @@
 <path fill="#c3c2b7" d="M120,102 H348.3 Q352.3,102 352.3,106 V120 Q352.3,124 348.3,124 H120 Z"/>
 <text class="v" x="362.3" y="118.0">8.6 s</text>
 <text class="l" x="108" y="158.0" text-anchor="end">jsift</text>
-<path fill="#2a78d6" d="M120,142 H123.0 Q127.0,142 127.0,146 V160 Q127.0,164 123.0,164 H120 Z"/>
-<text class="v w" x="137.0" y="158.0">0.26 s<tspan class="n" dx="12">67x faster than jq</tspan></text>
+<path fill="#2a78d6" d="M120,142 H121.0 Q125.0,142 125.0,146 V160 Q125.0,164 121.0,164 H120 Z"/>
+<text class="v w" x="135.0" y="158.0">0.08 s<tspan class="n" dx="12">210x faster than jq</tspan></text>
 <text class="l" x="108" y="198.0" text-anchor="end">jsift --fast</text>
 <path fill="#2a78d6" d="M120,182 H121.0 Q125.0,182 125.0,186 V200 Q125.0,204 121.0,204 H120 Z"/>
-<text class="v w" x="135.0" y="198.0">0.10 s<tspan class="n" dx="12">174x faster than jq</tspan></text>
+<text class="v w" x="135.0" y="198.0">0.07 s<tspan class="n" dx="12">235x faster than jq</tspan></text>
 <line stroke="#c3c2b7" x1="120" y1="56" x2="120" y2="210"/>
 </svg>

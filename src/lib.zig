@@ -103,6 +103,8 @@ fn errorMessage(err: anyerror, file_path: ?[*:0]const u8) []const u8 {
         error.TrailingTerms => "unexpected terms after the query (a missing AND or OR?); pass the input as file= or data=",
         error.MissingLimitValue => "--limit needs a number",
         error.InvalidLimit => "--limit must be a non-negative integer",
+        error.MissingThreadsValue => "--threads needs a number",
+        error.InvalidThreads => "--threads must be a positive integer",
         error.MissingFormatValue => "--format needs json, csv or tsv",
         error.InvalidFormat => "--format must be json, csv or tsv",
         error.InvalidCondition => "incomplete condition, expected <key> <op> <val>",

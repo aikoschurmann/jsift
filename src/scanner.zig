@@ -1161,8 +1161,10 @@ const Input = union(enum) {
     bytes: []const u8,
 };
 
-/// The most workers the default thread count uses. Measured on an Apple M2 Pro (6
-/// performance and 4 efficiency cores): parse-bound queries stop improving at about 8.
+/// The most threads the default thread count uses. Each thread parses at about 1.3 GB/s,
+/// so around 8 they reach what the single feeder can copy (about 12 GB/s), and more can't
+/// help. On an Apple M2 Pro (6 performance and 4 efficiency cores), parse-bound queries
+/// scale linearly to 6 threads; 10 are 7% faster than 8.
 pub const max_default_threads = 8;
 
 /// The thread count when --threads isn't given: one per CPU, up to `max_default_threads`.

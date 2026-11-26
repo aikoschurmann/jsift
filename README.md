@@ -30,12 +30,12 @@ A SIMD query engine for line-delimited JSON, for the command line and Python.</p
 
 <picture>
   <source media="(prefers-color-scheme: dark)" srcset="assets/benchmark-dark.svg">
-  <img src="assets/benchmark-light.svg" alt="Counting level eq error in 968 MB of JSONL: jq 17.4 s, jaq 8.6 s, jsift 0.26 s, jsift --fast 0.10 s" width="100%">
+  <img src="assets/benchmark-light.svg" alt="Counting level eq error in 968 MB of JSONL: jq 17.4 s, jaq 8.6 s, jsift 0.08 s, jsift --fast 0.07 s" width="100%">
 </picture>
 
 ## Why jsift
 
-- **Fast.** A SIMD search over the raw bytes rules out every line that provably can't match, so most of the file is never parsed. 20–60x faster than `jq`/`jaq`, and up to 10 GB/s with `--fast`.
+- **Fast.** A SIMD search over the raw bytes rules out every line that provably can't match, so most of the file is never parsed, and large inputs are scanned on all cores. Over 10 GB/s from a file, and 85–200x faster than `jaq` (20–65x on a single core).
 - **Exact.** Lines that might match go through a validating JSON parser that decides exactly. Nested paths, escapes and numbers like `9e1` work as in `jq`.
 - **A query language you already know.** Filter with `eq`, `gt`, `has`, `in`, `AND`/`OR`/`NOT` and parentheses, pull out fields with `SELECT`, and compute `count`/`sum`/`avg`/`min`/`max`, optionally `GROUP BY` a field.
 - **Python, too.** `pip install jsift` runs the same engine in-process, with the GIL released.
@@ -107,37 +107,52 @@ See [Usage](#usage) for the full query language and [Python](#python) for the AP
 
 ## Benchmarks
 
-All numbers are the best of 3 runs (5 for exact jsift, 1 for jq/jaq), with the file in the OS page cache, on an Apple M2 Pro (16 GB). Versions: jsift 1.0.0 (`ReleaseFast`), ripgrep 15.1.0, jaq 2.3.0, jq 1.7.1. Every tool returned the same matches. The `--fast` and ripgrep numbers were measured with jsift 1.0.0, which only had the byte-level layer. The commands are listed under [Reproducing the benchmarks](#reproducing-the-benchmarks).
+All numbers are the best of 5 runs (1 for jq/jaq), with the file in the OS page cache, on an Apple M2 Pro (6 performance and 4 efficiency cores, 16 GB). jsift is 3.0.0 plus the parallel scan (unreleased, on `main`), built with `ReleaseFast`, on its default 8 threads unless marked `-j 1`. The ripgrep 15.1.0, jaq 2.3.0 and jq 1.7.1 numbers are from an earlier run on the same machine; they don't depend on jsift. Every tool returned the same matches. The commands are listed under [Reproducing the benchmarks](#reproducing-the-benchmarks).
 
 ### Synthetic logs: 968 MB, 4 million lines
 
 Each line is a flat-ish log record of about 240 bytes with a nested `user` object and an array (see the generator below).
 
-| Query | jsift (exact) | jsift `--fast` (file) | jsift `--fast` (pipe) | ripgrep | jaq |
-|-------|-----------:|-----------:|-----------:|--------:|----:|
-| Key match: `level eq error` | 0.26 s · 3.7 GB/s | **0.10 s** · 10.0 GB/s | 0.27 s · 3.6 GB/s | 0.14 s · 6.9 GB/s | 8.6 s · 0.11 GB/s |
-| Numeric: `status gte 500` | 0.42 s · 2.3 GB/s | **0.15 s** · 6.3 GB/s | 0.27 s · 3.6 GB/s | 0.18 s · 5.5 GB/s | 8.8 s · 0.11 GB/s |
-| Substring: `msg has beef` | 0.40 s · 2.4 GB/s | **0.30 s** · 3.2 GB/s | 0.37 s · 2.6 GB/s | 0.58 s · 1.7 GB/s | 8.2 s · 0.12 GB/s |
-| AND/OR: `level eq error AND status eq 500 OR service eq auth AND status eq 404` | 0.32 s · 3.0 GB/s | **0.21 s** · 4.6 GB/s | 0.28 s · 3.5 GB/s | 1.48 s · 0.65 GB/s | 10.2 s · 0.09 GB/s |
-| TSV extraction: `SELECT service,status,bytes WHERE level eq warn` | 0.29 s · 3.4 GB/s | **0.13 s** · 7.3 GB/s | 0.26 s · 3.7 GB/s | — | 18.0 s · 0.05 GB/s |
-| JSON output: `--format json SELECT ts,user,latency_ms WHERE status eq 503` | 0.39 s · 2.5 GB/s | **0.23 s** · 4.2 GB/s | 0.31 s · 3.2 GB/s | — | 8.7 s · 0.11 GB/s |
-| Aggregates: `SELECT count:bytes,sum:bytes,avg:latency_ms WHERE status eq 200` | 0.58 s · 1.7 GB/s | **0.26 s** · 3.7 GB/s | 0.33 s · 3.0 GB/s | — | 11.1 s · 0.09 GB/s |
-| No match (full scan): `nosuchkey exists` | 0.12 s · 8.3 GB/s | **0.10 s** · 10.2 GB/s | 0.25 s · 3.8 GB/s | 0.11 s · 8.6 GB/s | — |
+| Query | jsift | jsift `-j 1` | jsift `--fast` | jsift (pipe) | ripgrep | jaq |
+|-------|------:|------:|------:|------:|--------:|----:|
+| Key match: `level eq error` | 0.08 s · 11.7 GB/s | 0.25 s · 4.0 GB/s | **0.07 s** · 13.1 GB/s | 0.30 s · 3.2 GB/s | 0.14 s · 6.9 GB/s | 8.6 s · 0.11 GB/s |
+| Numeric: `status gte 500` | 0.09 s · 10.9 GB/s | 0.40 s · 2.4 GB/s | **0.08 s** · 11.8 GB/s | 0.35 s · 2.8 GB/s | 0.18 s · 5.5 GB/s | 8.8 s · 0.11 GB/s |
+| Substring: `msg has beef` | 0.09 s · 11.0 GB/s | 0.39 s · 2.5 GB/s | **0.09 s** · 11.4 GB/s | 0.34 s · 2.9 GB/s | 0.58 s · 1.7 GB/s | 8.2 s · 0.12 GB/s |
+| AND/OR: `level eq error AND status eq 500 OR service eq auth AND status eq 404` | 0.09 s · 11.1 GB/s | 0.31 s · 3.2 GB/s | **0.08 s** · 11.7 GB/s | 0.32 s · 3.0 GB/s | 1.48 s · 0.65 GB/s | 10.2 s · 0.09 GB/s |
+| TSV extraction: `SELECT service,status,bytes WHERE level eq warn` | 0.09 s · 10.9 GB/s | 0.27 s · 3.5 GB/s | **0.08 s** · 11.8 GB/s | 0.32 s · 3.0 GB/s | — | 18.0 s · 0.05 GB/s |
+| JSON output: `--format json SELECT ts,user,latency_ms WHERE status eq 503` | 0.09 s · 11.0 GB/s | 0.38 s · 2.6 GB/s | **0.09 s** · 11.1 GB/s | 0.35 s · 2.8 GB/s | — | 8.7 s · 0.11 GB/s |
+| Aggregates: `SELECT count:bytes,sum:bytes,avg:latency_ms WHERE status eq 200` | 0.13 s · 7.4 GB/s | 0.60 s · 1.6 GB/s | **0.09 s** · 10.8 GB/s | 0.37 s · 2.6 GB/s | — | 11.1 s · 0.09 GB/s |
+| No match (full scan): `nosuchkey exists` | 0.08 s · 12.6 GB/s | 0.11 s · 8.9 GB/s | **0.08 s** · 12.9 GB/s | 0.27 s · 3.6 GB/s | 0.11 s · 8.6 GB/s | — |
 
 jq 1.7.1 took 17.4 s (0.06 GB/s) on the key match, about twice as long as jaq, so it was only run once.
 
 How to read this:
-- **Exact mode pays for the lines it parses.** Lines that can't match cost the same as in `--fast` (`nosuchkey exists`). Every line that might match is validated and evaluated by the parser, at roughly 1.3 GB/s. So the more lines match, the bigger the gap: `level eq error` matches a sixth of the lines, `status eq 200` over a third. A query that can't be ruled out from the bytes, such as `NOT level eq info`, parses every line (0.77 s here, vs 0.18 s with `--fast`).
-- **Pipe numbers are capped by the pipe.** Just `cat logs.jsonl | wc -c` takes 0.22 s (4.4 GB/s) here, and jsift's pipe times sit right at that ceiling. When you can, pass `--file`.
+- **Exact mode pays for the lines it parses.** Lines that can't match cost the same as in `--fast` (`nosuchkey exists`). Every line that might match is validated and evaluated by the parser, at roughly 1.3 GB/s per thread. So on one thread, the more lines match, the bigger the gap: `level eq error` matches a sixth of the lines, `status eq 200` over a third. With 8 threads most queries reach the same ceiling as `--fast`, about 12 GB/s: the speed at which a single reader thread copies the file out of the page cache.
+- **Pipe numbers are capped by the pipe.** Just `cat logs.jsonl | wc -c` takes 0.22 s (4.5 GB/s) here, and jsift's pipe times sit close to that ceiling. `--fast` through a pipe takes 0.27–0.33 s for every query above. When you can, pass the file.
 - **ripgrep compares raw text**, so its patterns are approximations. The AND/OR regex (`"level":"error".*"status":500|…`) only works because the keys always appear in the same order, and ripgrep can't parse numbers (`status gte 500` became `"status":5[0-9][0-9]`). jsift's queries understand JSON values and don't depend on key order.
 - ripgrep can't extract fields or aggregate, hence the dashes.
+
+### Threads
+
+Large inputs are scanned on several threads (see [Parallel scan](#5-parallel-scan)). The same queries on jsift 3.0.0, which scanned on one thread, and now; best of 3, on the 968 MB file. The output is byte-for-byte the same in every column.
+
+| Query | 3.0.0 | now, `-j 1` | now | 3.0.0, pipe | now, pipe |
+|-------|------:|------:|------:|------:|------:|
+| `-c level eq error` | 0.24 s | 0.24 s | **0.09 s** (2.7x) | 0.30 s | 0.30 s |
+| `-c NOT level eq info` (parses every line) | 0.75 s | 0.74 s | **0.15 s** (5.1x) | 0.81 s | **0.37 s** (2.2x) |
+| `-c status gte 500` | 0.40 s | 0.40 s | **0.09 s** (4.5x) | 0.48 s | **0.34 s** (1.4x) |
+| `SELECT count:bytes,sum:bytes,avg:latency_ms WHERE status eq 200` | 0.60 s | 0.59 s | **0.13 s** (4.6x) | 0.66 s | **0.36 s** (1.8x) |
+| `SELECT service,count:bytes,avg:latency_ms GROUP BY service` | 1.02 s | 1.03 s | **0.19 s** (5.4x) | 1.07 s | **0.37 s** (2.9x) |
+| `level eq error > out.txt` (writes 162 MB) | 0.28 s | 0.28 s | **0.13 s** (2.1x) | 0.37 s | **0.32 s** (1.2x) |
+
+Parse-bound queries scale linearly up to the 6 performance cores: `NOT level eq info` takes 0.74 s on 1 thread, 0.39 s on 2, 0.20 s on 4, 0.15 s on 6 and 0.14 s on 8. Cheap queries stop at the reader's copy speed sooner. Through a pipe, queries that one thread keeps up with gain nothing and stay on one thread. For the very cheapest, the median over 15 runs was 1–3% slower than 3.0.0: 0.272 s vs 0.269 s for `--fast -c level eq error`, and 0.286 s vs 0.277 s for `-c nosuchkey exists`. That is within a pipe's run-to-run noise, but it showed up consistently.
 
 <details>
 <summary><b>Real-world data: GitHub Archive, 3.1 GB</b></summary>
 
 <br>
 
-These were measured with jsift 1.0.0, so they correspond to `--fast`. In exact mode, keys inside nested objects need their path: `login eq torvalds` becomes `actor.login eq torvalds`.
+These were measured with jsift 1.0.0, on one thread, so they correspond to `--fast -j 1`. In exact mode, keys inside nested objects need their path: `login eq torvalds` becomes `actor.login eq torvalds`.
 
 Three hours of [GH Archive](https://www.gharchive.org/) events: 791,615 deeply nested lines, median 945 bytes. For reference, `rg -cF '"type":"MemberEvent"'` takes 0.33 s on this file.
 
@@ -186,6 +201,7 @@ Files are the terms left over once the query is complete, so `SELECT` fields and
 | `--count`, `-c` | Print only the number of matching lines |
 | `--header` | Print a header row of field names (TSV/CSV) |
 | `--limit <n>` | Stop after `n` matches |
+| `--threads <n>`, `-j <n>` | Scan on `n` threads (default: one per CPU, up to 8). `-j 1` scans on one thread. Inputs of 2 MB or less always do. The output is the same either way |
 | `--invert`, `-v` | Select the lines that don't match, like `grep -v`: the same as `NOT ( … )` around the whole condition. Lines that aren't valid JSON are still skipped |
 | `--line-number`, `-n` | Prefix each match with its line number in its file (`12:{...}`). With `SELECT` it is a first column named `line`, or a `"line"` member in JSON. Ignored by `--count` and aggregates |
 | `--fast` | Match on the raw bytes only, without the exact parse: faster, but approximate (see [Limitations](#limitations--trade-offs)) |
@@ -491,7 +507,7 @@ Before scanning, the query is compiled into a plan. Key paths are split and gath
 
 ### 2. Anchored block search
 
-Input is processed in 8 MB blocks, not line by line. Every matching line must pass at least one non-negated condition of some `OR` group, so jsift picks one such **anchor** per group and searches the whole block for anchors. Line boundaries are only looked up once an anchor passes. A line without an anchor costs a few vector compares and is never split out.
+Input is processed in blocks (8 MB on one thread, 512 KB chunks on several), not line by line. Every matching line must pass at least one non-negated condition of some `OR` group, so jsift picks one such **anchor** per group and searches the whole block for anchors. Line boundaries are only looked up once an anchor passes. A line without an anchor costs a few vector compares and is never split out.
 
 For a string `eq`, the anchor is the quoted **value** rather than the key: `"GollumEvent"` is far rarer than `"type"`, which appears in nearly every event. A hit counts only when `"type":` directly precedes it.
 
@@ -507,9 +523,16 @@ Testing each key separately gets slower with every key you add. From four differ
 
 On the GH Archive file this takes a 12-key `OR` from 1.92 s to 0.52 s.
 
-### 5. Double-buffered I/O
+### 5. Parallel scan
 
-A reader thread fills the next buffer while the main thread scans the current one, so the disk and the CPU work in parallel. For pipes, blocks are handed over at 128 KB, or sooner when no more input is immediately available. That keeps the data in cache while it's scanned, and makes slow streams like `tail -f` print matches right away. Lines longer than a block grow the buffer.
+A reader thread cuts the input into chunks that end at a newline: 512 KB for files, and for pipes 128 KB or whatever has arrived when the pipe runs dry, so slow streams like `tail -f` print matches right away. The chunks go to a ring of two slots per thread. Worker threads, each with its own parser and scratch space, scan chunks into output buffers of their own, and the main thread writes the buffers out in input order, so the output is the same as on one thread. Lines longer than a chunk grow its buffer.
+
+- **The main thread scans too.** It takes the chunk at the head of the line itself when no worker has, and workers are only woken once two chunks wait past it. Input that one thread keeps up with, as from most pipes, then goes through a single handoff per chunk and the workers sleep. Read buffers are reused most recently freed first, so that data is still in the cache when it is scanned.
+- **Aggregates are merged in order.** Every chunk counts, sums and groups into its own state, and the main thread folds them in chunk by chunk. Counts and integer sums are exact. Float sums keep both chunks' compensation, so they agree with the single-threaded sum to far more digits than the 15 printed; only values that cancel almost exactly could change the last printed digit. Min and max keep the first of equal values, and groups keep their first-seen order and spelling.
+- **`--limit` and `-n`.** A worker doesn't know how many matches or lines came before its chunk. The reader counts each chunk's newlines (only with `-n`) and gives it its starting line. The chunk that reaches the limit is scanned again by the main thread, which knows the count, so the output stops at exactly the right match. Then the workers stop. A reader waiting on a pipe that never ends is left to finish on its own, so `tail -f app.jsonl | jsift --limit 1 …` still exits.
+- **Small inputs stay on one thread,** and workers only start once chunks pile up, so `echo '{"a":1}' | jsift a exists` doesn't start a thread pool. Read and write errors are reported as on one thread, after the output of everything before them.
+
+With `-j 1`, a reader thread fills one 8 MB buffer (128 KB for pipes) while the main thread scans the other, as before.
 
 ### 6. Ruling lines out without losing matches
 
@@ -533,7 +556,7 @@ On the synthetic logs this parses 1.7x as fast as the single-pass parser it repl
 
 ### 8. No per-line allocation
 
-Apart from the two I/O buffers, the compiled plan and a reusable buffer for decoded strings, the scan allocates nothing. Values are extracted in place, output goes through one buffered writer, and aggregates are plain counters.
+Apart from the I/O buffers (two per thread), the compiled plan, each thread's output buffer and a reusable buffer for decoded strings, the scan allocates nothing. Values are extracted in place, output goes through one buffered writer, and aggregates are plain counters.
 
 ---
 
@@ -541,7 +564,7 @@ Apart from the two I/O buffers, the compiled plan and a reusable buffer for deco
 
 ### 1. Exact mode parses every line that might match
 
-Lines the byte search rules out cost almost nothing, but the rest are parsed at roughly 1.3 GB/s. Queries that match many lines, and `NOT`-only queries, which can't be ruled out from bytes at all, run several times slower than with `--fast` (see the benchmarks).
+Lines the byte search rules out cost almost nothing, but the rest are parsed at roughly 1.3 GB/s per thread. On one thread, queries that match many lines, and `NOT`-only queries, which can't be ruled out from bytes at all, run several times slower than with `--fast`. Several threads close most of that gap on files (see the benchmarks).
 
 ### 2. `--fast` is approximate
 
@@ -610,7 +633,7 @@ rg -c '"level":"error"' logs.jsonl
 jaq -c 'select(.level=="error")' logs.jsonl | wc -l
 ```
 
-Match queries are timed with `-c` on both jsift and ripgrep, because ripgrep stops after the first match when its output is `/dev/null`. Extraction and aggregation queries write their full output to a file.
+Match queries are timed with `-c` on both jsift and ripgrep, because ripgrep stops after the first match when its output is `/dev/null`. Extraction and aggregation queries write their full output to a file. Add `-j 1` for the single-threaded numbers.
 
 </details>
 

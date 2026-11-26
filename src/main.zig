@@ -21,6 +21,8 @@ pub fn main(init: std.process.Init) u8 {
             error.MissingFileValue => "jsift: --file needs a path",
             error.MissingLimitValue => "jsift: --limit needs a number",
             error.InvalidLimit => "jsift: --limit must be a non-negative integer",
+            error.MissingThreadsValue => "jsift: --threads needs a number",
+            error.InvalidThreads => "jsift: --threads must be a positive integer",
             error.MissingFormatValue => "jsift: --format needs json, csv or tsv",
             error.InvalidCondition => "jsift: incomplete condition, expected <key> <op> <val>",
             error.GroupWithoutSelect => "jsift: GROUP BY needs a SELECT, e.g. SELECT service,count:id GROUP BY service",

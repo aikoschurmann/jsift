@@ -73,6 +73,8 @@ pub fn printUsage() void {
         \\  --count, -c         Print only the count of matching lines
         \\  --header            Print column header row (for TSV/CSV with SELECT)
         \\  --limit <n>         Stop after n matches
+        \\  --threads, -j <n>   Scan on n threads (default: one per CPU, up to 8). -j 1 scans
+        \\                      on one thread. Output is the same either way.
         \\  --invert, -v        Print the lines that don't match (NOT around the whole query)
         \\  --line-number, -n   Prefix each match with its line number (a "line" column with SELECT)
         \\  --fast              Match on raw bytes only: faster, but approximate (keys at any depth,
@@ -416,6 +418,12 @@ pub fn parseArgs(allocator: std.mem.Allocator, args: []const []const u8) !Comman
             arg_index += 1;
             if (arg_index == args.len) return error.MissingLimitValue;
             config.limit = std.fmt.parseInt(usize, args[arg_index], 10) catch return error.InvalidLimit;
+        } else if (std.mem.eql(u8, arg, "--threads") or std.mem.eql(u8, arg, "-j")) {
+            arg_index += 1;
+            if (arg_index == args.len) return error.MissingThreadsValue;
+            const threads = std.fmt.parseInt(usize, args[arg_index], 10) catch return error.InvalidThreads;
+            if (threads == 0) return error.InvalidThreads;
+            config.threads = threads;
         } else if (std.mem.eql(u8, arg, "--format")) {
             arg_index += 1;
             if (arg_index == args.len) return error.MissingFormatValue;
@@ -564,6 +572,13 @@ test "parseArgs flags and errors" {
 
     const limit0 = (try parseArgs(allocator, &.{ "--limit", "0", "a", "exists" })).run;
     try std.testing.expectEqual(@as(?usize, 0), limit0.limit);
+
+    try std.testing.expectEqual(@as(?usize, null), limit0.threads);
+    try std.testing.expectEqual(@as(?usize, 3), (try parseArgs(allocator, &.{ "-j", "3", "a", "exists" })).run.threads);
+    try std.testing.expectEqual(@as(?usize, 1), (try parseArgs(allocator, &.{ "a", "exists", "--threads", "1" })).run.threads);
+    try std.testing.expectError(error.InvalidThreads, parseArgs(allocator, &.{ "-j", "0", "a", "exists" }));
+    try std.testing.expectError(error.InvalidThreads, parseArgs(allocator, &.{ "-j", "x", "a", "exists" }));
+    try std.testing.expectError(error.MissingThreadsValue, parseArgs(allocator, &.{ "a", "exists", "--threads" }));
 }
 
 /// Renders the groups as `a&!b|c`, one letter per key, for compact assertions.

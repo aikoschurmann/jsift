@@ -201,7 +201,7 @@ Files are the terms left over once the query is complete, so `SELECT` fields and
 | `--count`, `-c` | Print only the number of matching lines |
 | `--header` | Print a header row of field names (TSV/CSV) |
 | `--limit <n>` | Stop after `n` matches |
-| `--threads <n>`, `-j <n>` | Scan on `n` threads (default: one per CPU, up to 8). `-j 1` scans on one thread. Inputs of 2 MB or less always do. The output is the same either way |
+| `--threads <n>`, `-j <n>` | Scan on `n` threads (default: one per CPU, up to 8). `-j 1` scans on one thread, and so do files of 2 MB or less. The output is the same either way |
 | `--invert`, `-v` | Select the lines that don't match, like `grep -v`: the same as `NOT ( … )` around the whole condition. Lines that aren't valid JSON are still skipped |
 | `--line-number`, `-n` | Prefix each match with its line number in its file (`12:{...}`). With `SELECT` it is a first column named `line`, or a `"line"` member in JSON. Ignored by `--count` and aggregates |
 | `--fast` | Match on the raw bytes only, without the exact parse: faster, but approximate (see [Limitations](#limitations--trade-offs)) |
@@ -530,7 +530,7 @@ A reader thread cuts the input into chunks that end at a newline: 512 KB for fil
 - **The main thread scans too.** It takes the chunk at the head of the line itself when no worker has, and workers are only woken once two chunks wait past it. Input that one thread keeps up with, as from most pipes, then goes through a single handoff per chunk and the workers sleep. Read buffers are reused most recently freed first, so that data is still in the cache when it is scanned.
 - **Aggregates are merged in order.** Every chunk counts, sums and groups into its own state, and the main thread folds them in chunk by chunk. Counts and integer sums are exact. Float sums keep both chunks' compensation, so they agree with the single-threaded sum to far more digits than the 15 printed; only values that cancel almost exactly could change the last printed digit. Min and max keep the first of equal values, and groups keep their first-seen order and spelling.
 - **`--limit` and `-n`.** A worker doesn't know how many matches or lines came before its chunk. The reader counts each chunk's newlines (only with `-n`) and gives it its starting line. The chunk that reaches the limit is scanned again by the main thread, which knows the count, so the output stops at exactly the right match. Then the workers stop. A reader waiting on a pipe that never ends is left to finish on its own, so `tail -f app.jsonl | jsift --limit 1 …` still exits.
-- **Small inputs stay on one thread,** and workers only start once chunks pile up, so `echo '{"a":1}' | jsift a exists` doesn't start a thread pool. Read and write errors are reported as on one thread, after the output of everything before them.
+- **Small inputs stay on one thread.** Files of 2 MB or less are scanned as with `-j 1`, and on a pipe, workers only start once chunks pile up, so `echo '{"a":1}' | jsift a exists` starts none. Read and write errors are reported as on one thread, after the output of everything before them.
 
 With `-j 1`, a reader thread fills one 8 MB buffer (128 KB for pipes) while the main thread scans the other, as before.
 

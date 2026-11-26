@@ -107,7 +107,7 @@ See [Usage](#usage) for the full query language and [Python](#python) for the AP
 
 ## Benchmarks
 
-All numbers are the best of 5 runs (1 for jq/jaq), with the file in the OS page cache, on an Apple M2 Pro (6 performance and 4 efficiency cores, 16 GB). jsift is 3.0.0 plus the parallel scan (unreleased, on `main`), built with `ReleaseFast`, on its default 8 threads unless marked `-j 1`. The ripgrep 15.1.0, jaq 2.3.0 and jq 1.7.1 numbers are from an earlier run on the same machine; they don't depend on jsift. Every tool returned the same matches. The commands are listed under [Reproducing the benchmarks](#reproducing-the-benchmarks).
+All numbers are the best of 5 runs (1 for jq/jaq), with the file in the OS page cache, on an Apple M2 Pro (6 performance and 4 efficiency cores, 16 GB). jsift is 3.1.0, built with `ReleaseFast`, on its default 8 threads unless marked `-j 1`. The ripgrep 15.1.0, jaq 2.3.0 and jq 1.7.1 numbers are from an earlier run on the same machine; they don't depend on jsift. Every tool returned the same matches. The commands are listed under [Reproducing the benchmarks](#reproducing-the-benchmarks).
 
 ### Synthetic logs: 968 MB, 4 million lines
 
@@ -134,9 +134,9 @@ How to read this:
 
 ### Threads
 
-Large inputs are scanned on several threads (see [Parallel scan](#5-parallel-scan)). The same queries on jsift 3.0.0, which scanned on one thread, and now; best of 3, on the 968 MB file. The output is byte-for-byte the same in every column.
+Large inputs are scanned on several threads (see [Parallel scan](#5-parallel-scan)). The same queries on jsift 3.0.0, which scanned on one thread, and 3.1.0; best of 3, on the 968 MB file. The output is byte-for-byte the same in every column.
 
-| Query | 3.0.0 | now, `-j 1` | now | 3.0.0, pipe | now, pipe |
+| Query | 3.0.0 | 3.1.0, `-j 1` | 3.1.0 | 3.0.0, pipe | 3.1.0, pipe |
 |-------|------:|------:|------:|------:|------:|
 | `-c level eq error` | 0.24 s | 0.24 s | **0.09 s** (2.7x) | 0.30 s | 0.30 s |
 | `-c NOT level eq info` (parses every line) | 0.75 s | 0.74 s | **0.15 s** (5.1x) | 0.81 s | **0.37 s** (2.2x) |

@@ -1,7 +1,7 @@
 .{
     .name = .jsift,
     .fingerprint = 0x4fe31e28e4faa324,
-    .version = "3.0.0",
+    .version = "3.1.0",
     .minimum_zig_version = "0.16.0",
     .dependencies = .{},
     .paths = .{

@@ -2,15 +2,17 @@
 
 Python bindings for [jsift](https://github.com/aikoschurmann/jsift), a blisteringly fast JSONL
 search engine written in Zig. A SIMD search over the raw bytes skips every line that can't
-match, and a validating JSON parser decides the rest exactly. It is 20–60x faster than
-`jq`, and the results are exact.
+match, a validating JSON parser decides the rest exactly, and large inputs are scanned on
+all cores. It is 85–200x faster than `jaq` on 8 cores (20–65x on one), and the results
+are exact.
 
 ```bash
 pip install jsift
 ```
 
 The search runs in-process in native code, with the GIL released. Nothing runs as a
-subprocess.
+subprocess. Large inputs are scanned on one thread per CPU, up to 8; pass `threads=` to
+any function to change that (`threads=1` for one). The result is the same either way.
 
 ```python
 import jsift

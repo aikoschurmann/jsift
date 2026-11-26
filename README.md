@@ -453,7 +453,7 @@ if jsift --file logs.jsonl --count level eq error > /dev/null; then echo "errors
 
 ## Python
 
-The Python package bundles jsift as a native library and calls it directly. It doesn't start a subprocess or need a binary on your `PATH`. Queries use the same language as the CLI. The search runs with the GIL released, so other Python threads keep going, and several searches can run in parallel.
+The Python package bundles jsift as a native library and calls it directly. It doesn't start a subprocess or need a binary on your `PATH`. Queries use the same language as the CLI. The search runs with the GIL released, so other Python threads keep going, and several searches can run in parallel. Large inputs are scanned on several threads, as on the command line (`threads=1` for one).
 
 ```python
 import jsift
@@ -485,13 +485,13 @@ jsift.run("SELECT name,age", file="people.jsonl", format="csv", header=True).out
 
 | Function | Returns |
 |---|---|
-| `search(query, *, file=, data=, limit=, fast=, invert=)` | Matching lines (or SELECT rows) parsed as JSON: `list[dict]` |
+| `search(query, *, file=, data=, limit=, fast=, invert=, threads=)` | Matching lines (or SELECT rows) parsed as JSON: `list[dict]` |
 | `select(...)` | Same as `search`, with `SELECT` added to the front if missing |
 | `search_lines(...)` | Matching lines as `list[bytes]`, not parsed |
-| `count(query="", *, file=, data=, fast=, invert=)` | Number of matching lines: `int` |
-| `run(query, *, file=, data=, limit=, fast=, invert=, format=, count_only=, header=)` | `Result(output: bytes, matched: int)`: the CLI's exact output |
+| `count(query="", *, file=, data=, fast=, invert=, threads=)` | Number of matching lines: `int` |
+| `run(query, *, file=, data=, limit=, fast=, invert=, format=, count_only=, header=, threads=)` | `Result(output: bytes, matched: int)`: the CLI's exact output |
 
-A query is a string, split the way a shell splits a command line, or a list of tokens such as `["level", "eq", "error"]`. Pass exactly one of `file=` (a path) or `data=`. An invalid query, or a file that can't be read, raises `jsift.JsiftError`.
+A query is a string, split the way a shell splits a command line, or a list of tokens such as `["level", "eq", "error"]`. Pass exactly one of `file=` (a path) or `data=`. `threads=` is the number of threads to scan on (default: one per CPU, up to 8); the result is the same for any. An invalid query, or a file that can't be read, raises `jsift.JsiftError`.
 
 Wheels are available for macOS (arm64, x86_64) and Linux (x86_64 and aarch64; glibc and musl/Alpine). One wheel per platform covers every Python version from 3.9 up. On other platforms pip builds from source, which needs [Zig](https://ziglang.org/download/) 0.16.0.
 

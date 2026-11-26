@@ -135,3 +135,59 @@ def test_group_by():
 def test_invert():
     assert jsift.count("level eq error", data=DATA, invert=True) == 1
     assert [row["name"] for row in jsift.search("level eq error", data=DATA, invert=True)] == ["Bob"]
+
+
+def _big_data():
+    # About 10 MB: enough for many chunks, so it is scanned on several threads.
+    lines = []
+    for i in range(120_000):
+        level = "error" if i % 7 == 0 else "info"
+        lines.append('{"i": %d, "level": "%s", "svc": "s%d", "ms": %d.5}\n' % (i, level, i % 5, i % 1000))
+    return "".join(lines)
+
+
+@pytest.mark.parametrize("query", [
+    "level eq error",
+    "-n NOT level eq info",
+    "SELECT svc,count:i,sum:ms,max:i GROUP BY svc",
+    "--limit 1000 SELECT i WHERE level eq error",
+])
+def test_threads_give_the_same_output(query, tmp_path):
+    big = _big_data()
+    path = tmp_path / "big.jsonl"
+    path.write_text(big)
+    single = jsift.run(query, data=big, threads=1)
+    for threads in (None, 2, 8):
+        assert jsift.run(query, data=big, threads=threads) == single
+        assert jsift.run(query, file=path, threads=threads) == single
+    assert single.matched > 0
+
+
+def test_threads_keyword_everywhere():
+    big = _big_data()
+    assert jsift.count("level eq error", data=big, threads=4) == len(range(0, 120_000, 7))
+    assert len(jsift.search("level eq error", data=big, limit=3, threads=4)) == 3
+    assert len(jsift.search_lines("level eq error", data=big, threads=4)) == len(range(0, 120_000, 7))
+    assert jsift.select("count:i", data=big, threads=4) == [{"count:i": 120_000}]
+
+
+def test_threads_must_be_positive():
+    with pytest.raises(ValueError):
+        jsift.count("a exists", data=DATA, threads=0)
+
+
+def test_parallel_queries_from_several_threads():
+    # Every call scans on several threads of its own; calls must not interfere.
+    big = _big_data()
+    expected = jsift.run("SELECT svc,count:i GROUP BY svc", data=big, threads=1)
+    results = []
+
+    def work():
+        results.append(jsift.run("SELECT svc,count:i GROUP BY svc", data=big))
+
+    threads = [threading.Thread(target=work) for _ in range(6)]
+    for t in threads:
+        t.start()
+    for t in threads:
+        t.join()
+    assert results == [expected] * 6

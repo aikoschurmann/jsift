@@ -10,7 +10,8 @@ The query language is the same as the CLI's::
 
 Input is either ``file=`` (a path, read by jsift's own threaded reader) or ``data=``
 (``bytes``/``str`` of JSONL already in memory). The search runs in native code with the
-GIL released, so other Python threads keep running.
+GIL released, so other Python threads keep running. Large inputs are scanned on several
+threads, one per CPU up to 8; ``threads=`` sets the number (``threads=1`` for one).
 """
 
 from __future__ import annotations
@@ -63,16 +64,22 @@ def run(
     format: str | None = None,
     count_only: bool = False,
     header: bool = False,
+    threads: int | None = None,
 ) -> Result:
     """Runs a query and returns the raw output.
 
     ``query`` is a string (split like a shell command line) or a list of CLI tokens.
-    Exactly one of ``file`` and ``data`` must be given.
+    Exactly one of ``file`` and ``data`` must be given. ``threads`` is the number of
+    threads to scan on (default: one per CPU, up to 8); the output is the same for any.
     """
     if (file is None) == (data is None):
         raise TypeError("pass exactly one of file= or data=")
 
     args = _tokens(query)
+    if threads is not None:
+        if threads < 1:
+            raise ValueError("threads must be at least 1")
+        args = ["--threads", str(threads), *args]
     if limit is not None:
         if limit < 0:
             raise ValueError("limit must be non-negative")
@@ -125,9 +132,10 @@ def search_lines(
     limit: int | None = None,
     fast: bool = False,
     invert: bool = False,
+    threads: int | None = None,
 ) -> list[bytes]:
     """Returns the matching lines as raw bytes, without parsing them."""
-    return run(query, file=file, data=data, limit=limit, fast=fast, invert=invert).lines()
+    return run(query, file=file, data=data, limit=limit, fast=fast, invert=invert, threads=threads).lines()
 
 
 def search(
@@ -138,13 +146,14 @@ def search(
     limit: int | None = None,
     fast: bool = False,
     invert: bool = False,
+    threads: int | None = None,
 ) -> list[Any]:
     """Returns the matching lines parsed as JSON.
 
     For a ``SELECT`` query, each item is a dict of the selected fields; with aggregations
     the list holds a single dict.
     """
-    result = run(query, file=file, data=data, limit=limit, fast=fast, invert=invert, format="json")
+    result = run(query, file=file, data=data, limit=limit, fast=fast, invert=invert, format="json", threads=threads)
     return [json.loads(line) for line in result.lines()]
 
 
@@ -156,12 +165,13 @@ def select(
     limit: int | None = None,
     fast: bool = False,
     invert: bool = False,
+    threads: int | None = None,
 ) -> list[dict[str, Any]]:
     """Alias of :func:`search` for ``SELECT`` queries; ``SELECT`` is prepended if missing."""
     tokens = _tokens(query)
     if not tokens or tokens[0].lower() != "select":
         tokens = ["SELECT", *tokens]
-    return search(tokens, file=file, data=data, limit=limit, fast=fast, invert=invert)
+    return search(tokens, file=file, data=data, limit=limit, fast=fast, invert=invert, threads=threads)
 
 
 def count(
@@ -171,6 +181,7 @@ def count(
     data: Data | None = None,
     fast: bool = False,
     invert: bool = False,
+    threads: int | None = None,
 ) -> int:
     """Returns the number of matching lines (all lines when the query is empty)."""
-    return run(query, file=file, data=data, fast=fast, invert=invert, count_only=True).matched
+    return run(query, file=file, data=data, fast=fast, invert=invert, count_only=True, threads=threads).matched
